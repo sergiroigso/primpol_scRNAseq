@@ -19,7 +19,7 @@ This is an **optimized, production-ready** single-cell RNA-seq analysis pipeline
 ```r
 # Install required packages
 install.packages(c("Seurat", "ggplot2", "dplyr", "patchwork", "reshape2", 
-                   "ggrepel", "RColorBrewer", "ggalluvial"))
+                   "ggrepel", "RColorBrewer", "ggalluvial", "compositions"))
 
 BiocManager::install(c("scDblFinder", "SingleR", "celldex", 
                        "SingleCellExperiment", "clusterProfiler", 
