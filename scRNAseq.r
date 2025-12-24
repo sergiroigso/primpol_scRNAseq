@@ -1,0 +1,2595 @@
+# =============================================================================
+# 1. Packages
+# =============================================================================
+
+# Load required packages
+library(Seurat)
+library(scDblFinder)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(stringr)
+library(dplyr)
+library(patchwork)
+library(cacoa)
+library(ggrepel)
+library(RColorBrewer)
+library(ggalluvial)
+library(fgsea)
+library(msigdbr)
+library(reshape2)
+library(compositions)
+
+# Create directory structure for results
+dirs <- c("results", "results/spleen", "results/bonemarrow", 
+          "results/cacoa", "results/tissue_comparison")
+
+for (dir in dirs) {
+  if (!dir.exists(dir)) {
+    dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  }
+}
+
+# =============================================================================
+# 2. Global Parameters
+# =============================================================================
+
+# =============================================================================
+# GLOBAL ANALYSIS PARAMETERS
+# =============================================================================
+
+PARAMS <- list(
+  
+  # --- Reproducibility ---
+  random_seed = 1234,
+  
+  # --- QC Thresholds ---
+  qc = list(
+    min_features = 500,              # Minimum genes per cell
+    max_mt_spleen = 10,              # Max mitochondrial % for spleen
+    max_mt_bonemarrow = 12,          # Max mitochondrial % for bone marrow
+    min_complexity = 0.8,            # Minimum log10(genes)/log10(UMI)
+    doublet_method = "scDblFinder"   # Doublet detection method
+  ),
+  
+  # --- Normalization & Integration ---
+  normalization = list(
+    method = "LogNormalize",
+    scale_factor = 10000,
+    n_variable_features = 2000
+  ),
+  
+  # --- Dimensionality Reduction ---
+  pca = list(
+    npcs = 50,                       # Number of PCs to compute
+    dims_use = 1:30                  # PCs to use for downstream analysis
+  ),
+  
+  umap = list(
+    dims = 1:30,                     # PCs to use for UMAP
+    seed = 1234
+  ),
+  
+  # --- Clustering ---
+  clustering = list(
+    resolution = 0.5,                # Clustering resolution
+    algorithm = 1,                   # 1 = Louvain
+    dims = 1:30,                     # PCs to use for clustering
+    seed = 1234
+  ),
+  
+  # --- Cell Cycle Regression ---
+  cell_cycle = list(
+    regress = TRUE,                  # Whether to regress out cell cycle
+    vars_to_regress = c("S.Score", "G2M.Score")
+  ),
+  
+  # --- Differential Expression ---
+  deg = list(
+    test_use = "wilcox",             # Statistical test
+    min_pct = 0.1,                   # Min fraction of cells expressing
+    logfc_threshold = 0.25,          # Min log2FC threshold
+    min_cells_per_group = 3,         # Min cells per condition
+    padj_cutoff = 0.05               # Adjusted p-value cutoff
+  ),
+  
+  # --- GO Enrichment ---
+  go = list(
+    ont = "BP",                      # Biological Process
+    pvalue_cutoff = 0.05,
+    qvalue_cutoff = 0.2,
+    min_genes = 5                    # Min genes for enrichment
+  ),
+  
+  # --- GSEA ---
+  gsea = list(
+    min_size = 10,                   # Min genes in pathway
+    max_size = 500,                  # Max genes in pathway
+    padj_cutoff = 0.25,
+    top_n_plot = 20                  # Number of pathways to plot
+  ),
+  
+  # --- Compositional Analysis ---
+  compositional = list(
+    test_method = "fisher",          # Fisher's exact test
+    padj_cutoff = 0.05
+  ),
+  
+  # --- CACOA ---
+  cacoa = list(
+    n_pseudo_reps = 3,               # Number of pseudo-replicates
+    ref_level = "WT",
+    target_level = "KO",
+    n_cores = 4
+  ),
+  
+  # --- Cross-Tissue Comparison ---
+  comparison = list(
+    min_common_genes = 10,           # Min genes for correlation
+    correlation_method = "pearson"
+  ),
+  
+  # --- Output ---
+  output = list(
+    base_dir = "results",
+    save_intermediate = FALSE,       # Save intermediate objects
+    figure_format = c("pdf", "png"),
+    figure_dpi = 300,
+    figure_width = 12,
+    figure_height = 10
+  )
+)
+
+# Print key parameters
+cat("Key Analysis Parameters:\n")
+cat("------------------------\n")
+cat(sprintf("Random seed: %d\n", PARAMS$random_seed))
+cat(sprintf("Min features: %d\n", PARAMS$qc$min_features))
+cat(sprintf("Max MT%% (spleen): %d%%\n", PARAMS$qc$max_mt_spleen))
+cat(sprintf("Max MT%% (bone marrow): %d%%\n", PARAMS$qc$max_mt_bonemarrow))
+cat(sprintf("Clustering resolution: %.2f\n", PARAMS$clustering$resolution))
+cat(sprintf("DEG test: %s (padj < %.3f)\n", PARAMS$deg$test_use, PARAMS$deg$padj_cutoff))
+cat("\n")
+
+# Save parameters for reproducibility
+saveRDS(PARAMS, file.path(PARAMS$output$base_dir, "analysis_parameters.rds"))
+
+# =============================================================================
+# 3. Data Import
+# =============================================================================
+
+cat("\n=== IMPORTING DATA ===\n\n")
+
+# Define sample paths
+sample_paths <- list(
+  spl_WT = "DATA/WT_SPsample_filtered_feature_bc_matrix.h5",
+  spl_KO = "DATA/KO_SP_sample_filtered_feature_bc_matrix.h5",
+  bm_WT = "DATA/WT_BM_sample_filtered_feature_bc_matrix.h5",
+  bm_KO = "DATA/KO_BM_sample_filtered_feature_bc_matrix.h5"
+)
+
+# Import data with error handling
+import_with_check <- function(path, name) {
+  tryCatch({
+    data <- Read10X_h5(path)
+    cat(paste0("  ✓ ", name, ": ", ncol(data), " cells\n"))
+    return(data)
+  }, error = function(e) {
+    stop(paste0("Failed to read ", name, " from ", path, ": ", e$message))
+  })
+}
+
+spl_WT <- import_with_check(sample_paths$spl_WT, "Spleen WT")
+spl_KO <- import_with_check(sample_paths$spl_KO, "Spleen KO")
+bm_WT <- import_with_check(sample_paths$bm_WT, "Bone Marrow WT")
+bm_KO <- import_with_check(sample_paths$bm_KO, "Bone Marrow KO")
+
+cat("\n✓ Data imported successfully!\n\n")
+
+# =============================================================================
+# 4. QC Functions
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Run scDblFinder
+# -----------------------------------------------------------------------------
+run_scdblfinder <- function(seurat_obj) {
+  sce <- as.SingleCellExperiment(seurat_obj)
+  sce <- scDblFinder(sce)
+  seurat_obj$doublet_score <- sce$scDblFinder.score
+  seurat_obj$doublet_class <- sce$scDblFinder.class
+  return(seurat_obj)
+}
+
+# -----------------------------------------------------------------------------
+# Advanced QC filtering
+# -----------------------------------------------------------------------------
+apply_qc_filtering <- function(seurat_obj, 
+                               sample_name = "Sample",
+                               min_features = 500,
+                               max_features = NULL,
+                               max_count = NULL,
+                               max_mt = 12,
+                               min_complexity = 0.75) {
+  
+  cat(paste0("\n=== QC FILTERING: ", sample_name, " ===\n\n"))
+  
+  # Auto-detect upper limits
+  if (is.null(max_features)) {
+    max_features <- quantile(seurat_obj$nFeature_RNA, 0.995)
+  }
+  
+  if (is.null(max_count)) {
+    max_count <- quantile(seurat_obj$nCount_RNA, 0.995)
+  }
+  
+  # Calculate complexity
+  seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA) / 
+    log10(seurat_obj$nCount_RNA)
+  
+  # Count failures
+  n_before <- ncol(seurat_obj)
+  
+  fail_stats <- list(
+    low_features = sum(seurat_obj$nFeature_RNA <= min_features),
+    high_features = sum(seurat_obj$nFeature_RNA >= max_features),
+    high_count = sum(seurat_obj$nCount_RNA >= max_count),
+    high_mt = sum(seurat_obj$percent.mt >= max_mt),
+    low_complexity = sum(seurat_obj$log10GenesPerUMI <= min_complexity),
+    doublets = sum(seurat_obj$doublet_class == "doublet")
+  )
+  
+  cat("Cells failing filters:\n")
+  for (name in names(fail_stats)) {
+    cat(sprintf("  %s: %d\n", name, fail_stats[[name]]))
+  }
+  
+  # Apply filters
+  seurat_obj <- subset(seurat_obj,
+                       subset = nFeature_RNA > min_features &
+                         nFeature_RNA < max_features &
+                         nCount_RNA < max_count &
+                         percent.mt < max_mt &
+                         log10GenesPerUMI > min_complexity &
+                         doublet_class == "singlet")
+  
+  n_after <- ncol(seurat_obj)
+  n_removed <- n_before - n_after
+  pct_removed <- round(100 * n_removed / n_before, 2)
+  
+  cat(sprintf("\nSummary:\n"))
+  cat(sprintf("  Before: %d cells\n", n_before))
+  cat(sprintf("  After: %d cells\n", n_after))
+  cat(sprintf("  Removed: %d (%.2f%%)\n\n", n_removed, pct_removed))
+  
+  return(seurat_obj)
+}
+
+# -----------------------------------------------------------------------------
+# QC visualization
+# -----------------------------------------------------------------------------
+plot_qc_summary <- function(seurat_obj, sample_name = "Sample") {
+  
+  metadata <- seurat_obj@meta.data
+  
+  # Summary statistics
+  stats_df <- data.frame(
+    Sample = sample_name,
+    Total_cells = nrow(metadata),
+    Singlets = sum(metadata$doublet_class == "singlet", na.rm = TRUE),
+    Doublets = sum(metadata$doublet_class == "doublet", na.rm = TRUE),
+    Median_UMI = median(metadata$nCount_RNA),
+    Median_genes = median(metadata$nFeature_RNA),
+    Median_MT = round(median(metadata$percent.mt), 2),
+    stringsAsFactors = FALSE
+  )
+  
+  # Violin plots
+  p_violins <- VlnPlot(seurat_obj, 
+                       features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"),
+                       ncol = 4,
+                       pt.size = 0.1) & 
+    theme(plot.title = element_text(size = 10))
+  
+  # Doublet plots
+  if ("doublet_class" %in% colnames(metadata)) {
+    p_doublet <- ggplot(metadata, aes(x = doublet_score, fill = doublet_class)) +
+      geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+      scale_fill_manual(values = c("singlet" = "#2ecc71", "doublet" = "#e74c3c")) +
+      theme_classic() +
+      labs(title = paste0(sample_name, " - Doublet Detection"),
+           x = "Doublet Score", y = "Count")
+  } else {
+    p_doublet <- NULL
+  }
+  
+  return(list(
+    stats = stats_df,
+    violins = p_violins,
+    doublet = p_doublet
+  ))
+}
+
+cat("✓ QC functions loaded\n")
+
+
+# 5. QC Metrics and Filtering
+
+
+cat("\n=== CALCULATING QC METRICS ===\n\n")
+
+# Create Seurat objects
+samples <- list(
+  spl_WT = CreateSeuratObject(counts = spl_WT, project = "spl_WT"),
+  spl_KO = CreateSeuratObject(counts = spl_KO, project = "spl_KO"),
+  bm_WT = CreateSeuratObject(counts = bm_WT, project = "bm_WT"),
+  bm_KO = CreateSeuratObject(counts = bm_KO, project = "bm_KO")
+)
+
+# Calculate QC metrics
+samples <- lapply(samples, function(obj) {
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+  obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^Rp[sl]")
+  obj <- run_scdblfinder(obj)
+  return(obj)
+})
+
+# Unpack
+spl_WT_seurat <- samples$spl_WT
+spl_KO_seurat <- samples$spl_KO
+bm_WT_seurat <- samples$bm_WT
+bm_KO_seurat <- samples$bm_KO
+
+# Generate QC summaries
+qc_summaries <- list(
+  spl_WT = plot_qc_summary(spl_WT_seurat, "Spleen WT"),
+  spl_KO = plot_qc_summary(spl_KO_seurat, "Spleen KO"),
+  bm_WT = plot_qc_summary(bm_WT_seurat, "Bone Marrow WT"),
+  bm_KO = plot_qc_summary(bm_KO_seurat, "Bone Marrow KO")
+)
+
+# Combine stats
+qc_summary_table <- do.call(rbind, lapply(qc_summaries, function(x) x$stats))
+print(qc_summary_table)
+
+# Save
+write.csv(qc_summary_table, "results/qc_summary_statistics.csv", row.names = FALSE)
+
+# Display plots
+for (name in names(qc_summaries)) {
+  print(qc_summaries[[name]]$violins)
+  if (!is.null(qc_summaries[[name]]$doublet)) {
+    print(qc_summaries[[name]]$doublet)
+  }
+}
+
+cat("\n✓ QC metrics calculated\n")
+
+cat("\n=== APPLYING QC FILTERS ===\n\n")
+
+# Apply filtering with tissue-specific parameters
+spl_WT_seurat <- apply_qc_filtering(
+  spl_WT_seurat,
+  sample_name = "Spleen WT",
+  min_features = PARAMS$qc$min_features,
+  max_mt = PARAMS$qc$max_mt_spleen,
+  min_complexity = PARAMS$qc$min_complexity
+)
+
+spl_KO_seurat <- apply_qc_filtering(
+  spl_KO_seurat,
+  sample_name = "Spleen KO",
+  min_features = PARAMS$qc$min_features,
+  max_mt = PARAMS$qc$max_mt_spleen,
+  min_complexity = PARAMS$qc$min_complexity
+)
+
+bm_WT_seurat <- apply_qc_filtering(
+  bm_WT_seurat,
+  sample_name = "Bone Marrow WT",
+  min_features = PARAMS$qc$min_features,
+  max_mt = PARAMS$qc$max_mt_bonemarrow,
+  min_complexity = PARAMS$qc$min_complexity
+)
+
+bm_KO_seurat <- apply_qc_filtering(
+  bm_KO_seurat,
+  sample_name = "Bone Marrow KO",
+  min_features = PARAMS$qc$min_features,
+  max_mt = PARAMS$qc$max_mt_bonemarrow,
+  min_complexity = PARAMS$qc$min_complexity
+)
+
+# Clear large objects
+rm(spl_WT, spl_KO, bm_WT, bm_KO, samples)
+gc()
+
+cat("✓ QC filtering complete\n")
+
+# 6. Analysis Functions
+
+cat("\n=== LOADING ANALYSIS FUNCTIONS ===\n\n")
+
+# =============================================================================
+# ANNOTATION
+# =============================================================================
+
+annotate_immune_cells <- function(seurat_obj) {
+  cat("Running SingleR annotation...\n")
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  if (length(Layers(seurat_obj, assay = "RNA")) > 1) {
+    seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+  }
+  
+  sce <- as.SingleCellExperiment(seurat_obj)
+  immgen_ref <- celldex::ImmGenData()
+  
+  singler_results <- SingleR(
+    test = sce,
+    ref = immgen_ref,
+    labels = immgen_ref$label.fine
+  )
+  
+  seurat_obj$SingleR_labels <- singler_results$labels
+  seurat_obj$SingleR_clean <- gsub("\\s*\\([^\\)]+\\)", "", singler_results$labels)
+  seurat_obj$SingleR_confidence <- apply(singler_results$scores, 1, max)
+  
+  cat(paste0("✓ Identified ", length(unique(seurat_obj$SingleR_clean)), " cell types\n"))
+  
+  return(seurat_obj)
+}
+
+# =============================================================================
+# DIFFERENTIAL EXPRESSION
+# =============================================================================
+
+find_degs_per_celltype <- function(seurat_obj, 
+                                   celltype_column = "SingleR_clean",
+                                   condition_column = "condition", 
+                                   min_cells = 3,
+                                   params = PARAMS) {
+  
+  cat("\n=== DIFFERENTIAL EXPRESSION ANALYSIS ===\n\n")
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+  
+  cell_types <- unique(seurat_obj@meta.data[[celltype_column]])
+  deg_list <- list()
+  
+  for (ct in cell_types) {
+    cells_ct <- rownames(seurat_obj@meta.data[seurat_obj@meta.data[[celltype_column]] == ct, ])
+    n_wt <- sum(seurat_obj@meta.data[cells_ct, condition_column] == params$cacoa$ref_level)
+    n_ko <- sum(seurat_obj@meta.data[cells_ct, condition_column] == params$cacoa$target_level)
+    
+    if (n_wt < min_cells | n_ko < min_cells) {
+      cat(paste0("  Skipping ", ct, " (insufficient cells)\n"))
+      next
+    }
+    
+    cat(paste0("  ", ct, " (WT=", n_wt, ", KO=", n_ko, ")...\n"))
+    
+    seurat_subset <- subset(seurat_obj, cells = cells_ct)
+    
+    markers <- FindMarkers(
+      seurat_subset,
+      ident.1 = params$cacoa$target_level,
+      ident.2 = params$cacoa$ref_level,
+      group.by = condition_column,
+      min.pct = params$deg$min_pct,
+      logfc.threshold = params$deg$logfc_threshold,
+      test.use = params$deg$test_use,
+      verbose = FALSE
+    )
+    
+    if (nrow(markers) > 0) {
+      markers$gene <- rownames(markers)
+      markers$cell_type <- ct
+      markers$sig <- ifelse(markers$p_val_adj < params$deg$padj_cutoff, "Significant", "Not Significant")
+      deg_list[[ct]] <- markers
+      
+      n_up <- sum(markers$avg_log2FC > 0 & markers$p_val_adj < params$deg$padj_cutoff)
+      n_down <- sum(markers$avg_log2FC < 0 & markers$p_val_adj < params$deg$padj_cutoff)
+      cat(paste0("    ↑ ", n_up, " | ↓ ", n_down, "\n"))
+    }
+  }
+  
+  cat("\n✓ DEG analysis complete\n\n")
+  return(deg_list)
+}
+
+# =============================================================================
+# GO ENRICHMENT
+# =============================================================================
+
+run_go_enrichment <- function(deg_list, params = PARAMS) {
+  cat("\n=== GO ENRICHMENT ===\n\n")
+  
+  go_results <- list()
+  
+  for (ct in names(deg_list)) {
+    degs <- deg_list[[ct]]
+    
+    up_genes <- degs$gene[degs$avg_log2FC > 0 & degs$p_val_adj < params$deg$padj_cutoff]
+    down_genes <- degs$gene[degs$avg_log2FC < 0 & degs$p_val_adj < params$deg$padj_cutoff]
+    
+    if (length(up_genes) >= params$go$min_genes) {
+      cat(paste0("  ", ct, " - UP (n=", length(up_genes), ")\n"))
+      go_up <- enrichGO(
+        gene = up_genes,
+        OrgDb = org.Mm.eg.db,
+        keyType = "SYMBOL",
+        ont = params$go$ont,
+        pAdjustMethod = "BH",
+        pvalueCutoff = params$go$pvalue_cutoff,
+        qvalueCutoff = params$go$qvalue_cutoff
+      )
+      if (!is.null(go_up) && nrow(as.data.frame(go_up)) > 0) {
+        go_results[[paste0(ct, "_UP")]] <- go_up
+      }
+    }
+    
+    if (length(down_genes) >= params$go$min_genes) {
+      cat(paste0("  ", ct, " - DOWN (n=", length(down_genes), ")\n"))
+      go_down <- enrichGO(
+        gene = down_genes,
+        OrgDb = org.Mm.eg.db,
+        keyType = "SYMBOL",
+        ont = params$go$ont,
+        pAdjustMethod = "BH",
+        pvalueCutoff = params$go$pvalue_cutoff,
+        qvalueCutoff = params$go$qvalue_cutoff
+      )
+      if (!is.null(go_down) && nrow(as.data.frame(go_down)) > 0) {
+        go_results[[paste0(ct, "_DOWN")]] <- go_down
+      }
+    }
+  }
+  
+  cat("\n✓ GO enrichment complete\n\n")
+  return(go_results)
+}
+
+# =============================================================================
+# GSEA
+# =============================================================================
+
+run_gsea_per_celltype <- function(deg_list, gene_sets = NULL, params = PARAMS) {
+  cat("\n=== GSEA ===\n\n")
+  
+  if (is.null(gene_sets)) {
+    m_gene_sets <- msigdbr(species = "Mus musculus", category = "H")
+    m_go_sets <- msigdbr(species = "Mus musculus", category = "C5", subcategory = "GO:BP")
+    gene_sets <- rbind(m_gene_sets, m_go_sets)
+  }
+  
+  pathways <- split(gene_sets$gene_symbol, gene_sets$gs_name)
+  gsea_results <- list()
+  
+  for (ct in names(deg_list)) {
+    cat(paste0("  ", ct, "...\n"))
+    
+    genes <- deg_list[[ct]]
+    genes <- genes[!is.na(genes$avg_log2FC) & !is.na(genes$p_val), ]
+    genes$rank_metric <- genes$avg_log2FC + 
+      sign(genes$avg_log2FC) * (-log10(genes$p_val + 1e-300)) * 0.001
+    
+    gene_ranks <- setNames(genes$rank_metric, genes$gene)
+    gene_ranks <- sort(gene_ranks, decreasing = TRUE)
+    gene_ranks <- gene_ranks[!duplicated(names(gene_ranks))]
+    
+    tryCatch({
+      fgsea_res <- fgsea(
+        pathways = pathways,
+        stats = gene_ranks,
+        minSize = params$gsea$min_size,
+        maxSize = params$gsea$max_size
+      )
+      fgsea_res <- fgsea_res[!is.na(fgsea_res$padj) & fgsea_res$padj < params$gsea$padj_cutoff, ]
+      
+      if (nrow(fgsea_res) > 0) {
+        gsea_results[[ct]] <- fgsea_res
+        cat(paste0("    Found ", nrow(fgsea_res), " pathways\n"))
+      }
+    }, error = function(e) {
+      cat(paste0("    Error: ", e$message, "\n"))
+    })
+  }
+  
+  cat("\n✓ GSEA complete\n\n")
+  return(gsea_results)
+}
+
+plot_gsea_results <- function(gsea_results, top_n = 20) {
+  plots <- list()
+  
+  for (ct in names(gsea_results)) {
+    gsea_df <- gsea_results[[ct]]
+    if (nrow(gsea_df) == 0) next
+    
+    gsea_df <- gsea_df[order(abs(gsea_df$NES), decreasing = TRUE), ]
+    gsea_df <- head(gsea_df, top_n)
+    gsea_df$pathway_clean <- gsub("HALLMARK_|GOBP_", "", gsea_df$pathway)
+    gsea_df$pathway_clean <- gsub("_", " ", gsea_df$pathway_clean)
+    gsea_df$pathway_clean <- substr(gsea_df$pathway_clean, 1, 50)
+    gsea_df$direction <- ifelse(gsea_df$NES > 0, "Upregulated", "Downregulated")
+    
+    p <- ggplot(gsea_df, aes(x = reorder(pathway_clean, NES), y = NES, fill = direction)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      scale_fill_manual(values = c("Upregulated" = "#e74c3c", "Downregulated" = "#3498db")) +
+      theme_classic(base_size = 12) +
+      labs(title = paste0("GSEA - ", ct), x = "Pathway", y = "NES", fill = "Direction") +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+    
+    plots[[ct]] <- p
+  }
+  
+  return(plots)
+}
+
+cat("✓ DEG, GO, GSEA functions loaded\n")
+
+# =============================================================================
+# CACOA FUNCTIONS
+# =============================================================================
+
+prepare_cacoa_data <- function(seurat_obj, 
+                               sample_column = "condition",
+                               celltype_column = "SingleR_clean") {
+  
+  sample_groups <- setNames(seurat_obj@meta.data[[sample_column]], colnames(seurat_obj))
+  cell_groups <- setNames(seurat_obj@meta.data[[celltype_column]], colnames(seurat_obj))
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  if (length(Layers(seurat_obj, assay = "RNA")) > 1) {
+    seurat_obj <- JoinLayers(seurat_obj, assay = "RNA")
+  }
+  
+  expr_matrix <- GetAssayData(seurat_obj, assay = "RNA", slot = "data")
+  
+  return(list(
+    expr_matrix = expr_matrix,
+    sample_groups = sample_groups,
+    cell_groups = cell_groups,
+    seurat_obj = seurat_obj
+  ))
+}
+
+create_pseudo_replicates <- function(seurat_obj, 
+                                     condition_column = "condition",
+                                     n_pseudo_reps = 3,
+                                     seed = 1234) {
+  set.seed(seed)
+  
+  conditions <- unique(seurat_obj@meta.data[[condition_column]])
+  cell_to_pseudorep <- character(ncol(seurat_obj))
+  names(cell_to_pseudorep) <- colnames(seurat_obj)
+  
+  for (cond in conditions) {
+    cells_cond <- colnames(seurat_obj)[seurat_obj@meta.data[[condition_column]] == cond]
+    pseudo_reps <- sample(1:n_pseudo_reps, length(cells_cond), replace = TRUE)
+    cell_to_pseudorep[cells_cond] <- paste0(cond, "_rep", pseudo_reps)
+  }
+  
+  return(cell_to_pseudorep)
+}
+
+run_cacoa_analysis <- function(seurat_obj,
+                               sample_column = "condition",
+                               celltype_column = "SingleR_clean",
+                               params = PARAMS) {
+  
+  cat("\n=== CACOA ANALYSIS ===\n\n")
+  
+  cacoa_data <- prepare_cacoa_data(seurat_obj, sample_column, celltype_column)
+  seurat_obj <- cacoa_data$seurat_obj
+  
+  pseudo_reps <- create_pseudo_replicates(
+    seurat_obj, 
+    sample_column, 
+    params$cacoa$n_pseudo_reps,
+    params$random_seed
+  )
+  
+  unique_pseudo_reps <- unique(pseudo_reps)
+  sample_groups <- sapply(strsplit(unique_pseudo_reps, "_rep"), `[`, 1)
+  names(sample_groups) <- unique_pseudo_reps
+  sample_groups <- factor(sample_groups, 
+                          levels = c(params$cacoa$ref_level, params$cacoa$target_level))
+  
+  cat(paste0("Created ", length(unique_pseudo_reps), " pseudo-replicates\n"))
+  cat(paste0("  ", params$cacoa$ref_level, ": ", 
+             sum(sample_groups == params$cacoa$ref_level), " replicates\n"))
+  cat(paste0("  ", params$cacoa$target_level, ": ", 
+             sum(sample_groups == params$cacoa$target_level), " replicates\n\n"))
+  
+  embedding <- Embeddings(seurat_obj, reduction = "umap")
+  DefaultAssay(seurat_obj) <- "integrated"
+  graph <- seurat_obj@graphs$integrated_snn
+  if (!inherits(graph, "dgCMatrix")) {
+    graph <- as(graph, "dgCMatrix")
+  }
+  
+  cao <- Cacoa$new(
+    data.object = cacoa_data$expr_matrix,
+    cell.groups = cacoa_data$cell_groups,
+    sample.groups = sample_groups,
+    sample.per.cell = pseudo_reps,
+    ref.level = params$cacoa$ref_level,
+    target.level = params$cacoa$target_level,
+    graph = graph,
+    embedding = embedding,
+    n.cores = params$cacoa$n_cores,
+    verbose = FALSE
+  )
+  
+  cao$estimateExpressionShiftMagnitudes()
+  cao$estimateCellLoadings()
+  cao$estimateCellDensity()
+  cao$estimateDiffCellDensity(type = "wilcox")
+  
+  cat("✓ CACOA analysis complete\n\n")
+  return(cao)
+}
+
+plot_cacoa_results <- function(cao, tissue_name = "tissue") {
+  plot_list <- list()
+  
+  tryCatch({
+    plot_list$abundance_changes <- cao$plotCellLoadings(show.pvals = TRUE)
+  }, error = function(e) {})
+  
+  tryCatch({
+    plot_list$expression_shifts <- cao$plotExpressionShiftMagnitudes()
+  }, error = function(e) {})
+  
+  tryCatch({
+    cell_counts <- table(cao$cell.groups, cao$sample.per.cell)
+    cell_props <- prop.table(cell_counts, margin = 2) * 100
+    df_props <- as.data.frame(cell_props)
+    colnames(df_props) <- c("CellType", "Sample", "Percentage")
+    df_props$Condition <- cao$sample.groups[match(df_props$Sample, names(cao$sample.groups))]
+    df_props$Condition <- factor(df_props$Condition, levels = c("WT", "KO"))
+    
+    plot_list$composition_barplot <- ggplot(df_props, aes(x = Sample, y = Percentage, fill = CellType)) +
+      geom_bar(stat = "identity") +
+      facet_wrap(~Condition, scales = "free_x") +
+      theme_classic(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+      ggtitle(paste0("Cell Type Composition - ", tissue_name))
+  }, error = function(e) {})
+  
+  return(plot_list)
+}
+
+extract_cacoa_results_table <- function(cao) {
+  cell_counts <- table(cao$cell.groups, cao$sample.groups[cao$sample.per.cell])
+  cell_props <- prop.table(cell_counts, margin = 2) * 100
+  
+  wt_props <- cell_props[, "WT"]
+  ko_props <- cell_props[, "KO"]
+  log2fc <- log2((ko_props + 0.01) / (wt_props + 0.01))
+  
+  results <- data.frame(
+    CellType = names(wt_props),
+    WT_percent = as.numeric(wt_props),
+    KO_percent = as.numeric(ko_props),
+    Difference = as.numeric(ko_props - wt_props),
+    log2FC = as.numeric(log2fc),
+    stringsAsFactors = FALSE
+  )
+  
+  results <- results[order(-results$log2FC), ]
+  rownames(results) <- NULL
+  
+  return(results)
+}
+
+export_cacoa_results <- function(cao, cacoa_plots, results_table, 
+                                 output_dir = "results/cacoa", 
+                                 prefix = "tissue") {
+  
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  write.csv(results_table, 
+            file.path(output_dir, paste0(prefix, "_cacoa_results.csv")),
+            row.names = FALSE)
+  
+  pdf(file.path(output_dir, paste0(prefix, "_cacoa_plots.pdf")), 
+      width = 12, height = 10)
+  
+  if (!is.null(cacoa_plots$abundance_changes)) print(cacoa_plots$abundance_changes)
+  if (!is.null(cacoa_plots$expression_shifts)) print(cacoa_plots$expression_shifts)
+  if (!is.null(cacoa_plots$composition_barplot)) print(cacoa_plots$composition_barplot)
+  
+  dev.off()
+  
+  saveRDS(cao, file.path(output_dir, paste0(prefix, "_cacoa_object.rds")))
+}
+
+# =============================================================================
+# COMPOSITIONAL ANALYSIS
+# =============================================================================
+
+run_compositional_analysis <- function(seurat_obj, 
+                                       celltype_column = "SingleR_clean",
+                                       condition_column = "condition",
+                                       params = PARAMS) {
+  
+  counts <- table(seurat_obj@meta.data[[celltype_column]],
+                  seurat_obj@meta.data[[condition_column]])
+  
+  results <- data.frame(
+    CellType = rownames(counts),
+    WT_count = counts[, params$cacoa$ref_level],
+    KO_count = counts[, params$cacoa$target_level],
+    WT_percent = (counts[, params$cacoa$ref_level] / sum(counts[, params$cacoa$ref_level])) * 100,
+    KO_percent = (counts[, params$cacoa$target_level] / sum(counts[, params$cacoa$target_level])) * 100,
+    log2FC = log2((counts[, params$cacoa$target_level] + 1) / (counts[, params$cacoa$ref_level] + 1)),
+    p_value = NA,
+    p_adj = NA,
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:nrow(results)) {
+    ct_count <- c(results$WT_count[i], results$KO_count[i])
+    other_count <- c(sum(results$WT_count[-i]), sum(results$KO_count[-i]))
+    contingency <- matrix(c(ct_count, other_count), nrow = 2, byrow = TRUE)
+    fisher_result <- fisher.test(contingency)
+    results$p_value[i] <- fisher_result$p.value
+  }
+  
+  results$p_adj <- p.adjust(results$p_value, method = "BH")
+  results <- results[order(results$p_adj), ]
+  
+  return(list(results = results, counts = counts))
+}
+
+plot_compositional_results <- function(comp_results, tissue_name = "tissue") {
+  results <- comp_results$results
+  counts <- comp_results$counts
+  
+  # Volcano plot
+  results$sig <- ifelse(results$p_adj < 0.05, "Significant", "Not Significant")
+  
+  p_volcano <- ggplot(results, aes(x = log2FC, y = -log10(p_adj), color = sig, label = CellType)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+    scale_color_manual(values = c("Significant" = "#e74c3c", "Not Significant" = "grey")) +
+    geom_text_repel(data = subset(results, p_adj < 0.05), size = 3) +
+    theme_classic(base_size = 14) +
+    labs(title = paste0("Compositional Changes - ", tissue_name),
+         x = "Log2 Fold Change (KO/WT)",
+         y = "-log10(Adjusted p-value)") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  # Alluvial plot
+  props <- prop.table(counts, margin = 2) * 100
+  props_df <- as.data.frame(props)
+  colnames(props_df) <- c("CellType", "Condition", "Proportion")
+  props_df$Condition <- factor(props_df$Condition, levels = c("WT", "KO"))
+  
+  n_celltypes <- length(unique(props_df$CellType))
+  colors <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_celltypes)
+  names(colors) <- unique(props_df$CellType)
+  
+  p_alluvial <- ggplot(props_df,
+                       aes(x = Condition, stratum = CellType, alluvium = CellType,
+                           y = Proportion, fill = CellType)) +
+    geom_alluvium(alpha = 0.6, knot.pos = 0.4) +
+    geom_stratum(alpha = 0.9, color = "grey70", width = 0.3) +
+    scale_fill_manual(values = colors, name = "Cell Type") +
+    labs(x = "", y = "Cell Proportion (%)",
+         title = paste0("Flow of Cell Type Proportions - ", tissue_name)) +
+    theme_minimal(base_size = 14) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  return(list(volcano = p_volcano, alluvial = p_alluvial))
+}
+
+cat("✓ CACOA and Compositional analysis functions loaded\n")
+
+
+# =============================================================================
+# COMPOSITIONAL DATA ANALYSIS (CLR METHOD)
+# =============================================================================
+
+compositional_analysis_proper <- function(seurat_obj, 
+                                          celltype_column = "SingleR_clean",
+                                          condition_column = "condition",
+                                          params = PARAMS) {
+  
+  cat("\n=== COMPOSITIONAL DATA ANALYSIS (CLR METHOD) ===\n")
+  cat("Using Centered Log-Ratio transformation to account for compositional constraint\n\n")
+  
+  # Get counts
+  counts <- table(seurat_obj@meta.data[[celltype_column]],
+                  seurat_obj@meta.data[[condition_column]])
+  
+  cat(paste0("Analyzing ", nrow(counts), " cell types\n"))
+  cat(paste0("Conditions: ", paste(colnames(counts), collapse = " vs "), "\n\n"))
+  
+  # Convert to proportions
+  props <- prop.table(counts, margin = 2)
+  
+  # CLR transformation function
+  clr_transform <- function(x) {
+    # Add small pseudocount to avoid log(0)
+    x_pseudo <- x + 1e-6
+    # CLR: log(x) - mean(log(x))
+    log(x_pseudo) - mean(log(x_pseudo))
+  }
+  
+  # Apply CLR to each condition
+  clr_wt <- clr_transform(props[, params$cacoa$ref_level])
+  clr_ko <- clr_transform(props[, params$cacoa$target_level])
+  
+  # Calculate difference in CLR space
+  clr_diff <- clr_ko - clr_wt
+  
+  # Create results dataframe
+  results <- data.frame(
+    CellType = names(clr_diff),
+    WT_percent = props[names(clr_diff), params$cacoa$ref_level] * 100,
+    KO_percent = props[names(clr_diff), params$cacoa$target_level] * 100,
+    WT_count = counts[names(clr_diff), params$cacoa$ref_level],
+    KO_count = counts[names(clr_diff), params$cacoa$target_level],
+    CLR_WT = clr_wt,
+    CLR_KO = clr_ko,
+    CLR_difference = clr_diff,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add interpretation based on CLR difference magnitude
+  results$Interpretation <- case_when(
+    abs(results$CLR_difference) > 1.0 ~ "Large change",
+    abs(results$CLR_difference) > 0.5 ~ "Moderate change",
+    abs(results$CLR_difference) > 0.2 ~ "Small change",
+    TRUE ~ "Negligible"
+  )
+  
+  results$Direction <- ifelse(results$CLR_difference > 0, "Enriched in KO", "Depleted in KO")
+  
+  # Sort by magnitude of change
+  results <- results[order(-abs(results$CLR_difference)), ]
+  rownames(results) <- NULL
+  
+  # Print summary
+  cat("Compositional changes summary:\n")
+  cat("─────────────────────────────\n")
+  cat(sprintf("Large changes (|CLR| > 1.0): %d\n", 
+              sum(abs(results$CLR_difference) > 1.0)))
+  cat(sprintf("Moderate changes (|CLR| > 0.5): %d\n", 
+              sum(abs(results$CLR_difference) > 0.5)))
+  cat(sprintf("Small changes (|CLR| > 0.2): %d\n\n", 
+              sum(abs(results$CLR_difference) > 0.2)))
+  
+  # Print top changes
+  cat("Top compositional changes:\n")
+  print(results[1:min(10, nrow(results)), 
+                c("CellType", "WT_percent", "KO_percent", 
+                  "CLR_difference", "Interpretation")])
+  cat("\n")
+  
+  return(list(
+    results = results,
+    counts = counts,
+    props = props
+  ))
+}
+
+# -----------------------------------------------------------------------------
+# VISUALIZATION FOR CLR RESULTS
+# -----------------------------------------------------------------------------
+
+plot_clr_compositional <- function(clr_results, tissue_name = "tissue") {
+  
+  results <- clr_results$results
+  
+  # Assign colors based on magnitude and direction
+  results$Color <- case_when(
+    results$CLR_difference > 1.0 ~ "Strong enrichment",
+    results$CLR_difference > 0.5 ~ "Moderate enrichment",
+    results$CLR_difference > 0 ~ "Mild enrichment",
+    results$CLR_difference > -0.5 ~ "Mild depletion",
+    results$CLR_difference > -1.0 ~ "Moderate depletion",
+    TRUE ~ "Strong depletion"
+  )
+  
+  results$Color <- factor(results$Color, 
+                          levels = c("Strong enrichment", "Moderate enrichment", 
+                                     "Mild enrichment", "Mild depletion", 
+                                     "Moderate depletion", "Strong depletion"))
+  
+  # Plot 1: CLR difference barplot
+  p_clr <- ggplot(results, aes(x = reorder(CellType, CLR_difference), 
+                               y = CLR_difference,
+                               fill = Color)) +
+    geom_bar(stat = "identity") +
+    geom_hline(yintercept = c(-1, -0.5, 0, 0.5, 1), 
+               linetype = "dashed", color = "grey50", alpha = 0.5) +
+    coord_flip() +
+    scale_fill_manual(
+      values = c(
+        "Strong enrichment" = "#d62728",
+        "Moderate enrichment" = "#ff7f0e", 
+        "Mild enrichment" = "#ffbb78",
+        "Mild depletion" = "#aec7e8",
+        "Moderate depletion" = "#1f77b4",
+        "Strong depletion" = "#17426b"
+      ),
+      name = "Change Magnitude"
+    ) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("Compositional Changes (CLR) - ", tissue_name),
+      subtitle = "Centered Log-Ratio accounts for compositional constraint",
+      x = "Cell Type",
+      y = "CLR Difference (KO - WT)",
+      caption = "|CLR| > 1.0 = Large change | |CLR| > 0.5 = Moderate change"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      plot.caption = element_text(hjust = 0.5, size = 9, color = "grey50"),
+      legend.position = "right"
+    )
+  
+  # Plot 2: CLR space visualization (WT vs KO)
+  p_scatter <- ggplot(results, aes(x = CLR_WT, y = CLR_KO, 
+                                   label = CellType, color = Color)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_text_repel(size = 3, max.overlaps = 15) +
+    scale_color_manual(
+      values = c(
+        "Strong enrichment" = "#d62728",
+        "Moderate enrichment" = "#ff7f0e",
+        "Mild enrichment" = "#ffbb78",
+        "Mild depletion" = "#aec7e8",
+        "Moderate depletion" = "#1f77b4",
+        "Strong depletion" = "#17426b"
+      ),
+      name = "Change"
+    ) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("CLR Space Comparison - ", tissue_name),
+      subtitle = "Points above diagonal = enriched in KO | Points below = depleted in KO",
+      x = "CLR (WT)",
+      y = "CLR (KO)"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 10)
+    )
+  
+  # Plot 3: Proportions comparison (for reference)
+  props <- clr_results$props
+  props_df <- as.data.frame(props * 100)
+  props_df$CellType <- rownames(props_df)
+  props_long <- reshape2::melt(props_df, id.vars = "CellType",
+                               variable.name = "Condition", 
+                               value.name = "Percentage")
+  
+  p_props <- ggplot(props_long, aes(x = CellType, y = Percentage, 
+                                    fill = Condition)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    coord_flip() +
+    scale_fill_manual(values = c("WT" = "#3498db", "KO" = "#e74c3c")) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("Cell Type Proportions - ", tissue_name),
+      subtitle = "Raw proportions (for reference)",
+      x = "Cell Type",
+      y = "Percentage (%)"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "top"
+    )
+  
+  return(list(
+    clr_barplot = p_clr,
+    clr_scatter = p_scatter,
+    proportions = p_props
+  ))
+}
+
+cat("✓ CLR compositional analysis functions loaded\n")
+
+# =============================================================================
+# EXPORT FUNCTIONS
+# =============================================================================
+
+export_tissue_results <- function(seurat_obj, 
+                                  deg_list, 
+                                  go_results, 
+                                  gsea_results,
+                                  comp_results, 
+                                  clr_results = NULL,
+                                  tissue_name = "tissue",
+                                  output_dir = "results") {
+  
+  # ADD ERROR CHECKING
+  if (is.null(tissue_name) || tissue_name == "") {
+    stop("tissue_name cannot be NULL or empty")
+  }
+  
+  if (is.null(output_dir) || output_dir == "") {
+    stop("output_dir cannot be NULL or empty")
+  }
+  
+  cat(paste0("Exporting results for: ", tissue_name, "\n"))
+  cat(paste0("Output directory: ", output_dir, "\n"))
+  
+  tissue_lower <- tolower(gsub(" ", "", tissue_name))
+  tissue_dir <- file.path(output_dir, tissue_lower)
+  
+  cat(paste0("Creating directory: ", tissue_dir, "\n"))
+  
+  dir.create(file.path(tissue_dir, "DEG"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tissue_dir, "GO"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tissue_dir, "GSEA"), recursive = TRUE, showWarnings = FALSE)
+  
+  
+  # Export DEGs
+  for (ct in names(deg_list)) {
+    filename <- paste0("DEG_", gsub("[/ ]", "_", ct), "_KO_vs_WT.csv")
+    write.csv(deg_list[[ct]], file.path(tissue_dir, "DEG", filename), row.names = FALSE)
+  }
+  
+  # Export GO
+  if (!is.null(go_results) && length(go_results) > 0) {
+    for (result_name in names(go_results)) {
+      filename <- paste0("GO_", gsub("[/ ]", "_", result_name), ".csv")
+      go_df <- if (class(go_results[[result_name]])[1] == "enrichResult") {
+        as.data.frame(go_results[[result_name]])
+      } else {
+        go_results[[result_name]]
+      }
+      write.csv(go_df, file.path(tissue_dir, "GO", filename), row.names = FALSE)
+    }
+  }
+  
+  # Export GSEA
+  if (!is.null(gsea_results) && length(gsea_results) > 0) {
+    for (ct in names(gsea_results)) {
+      filename <- paste0("GSEA_", gsub("[/ ]", "_", ct), ".csv")
+      gsea_df <- as.data.frame(gsea_results[[ct]])
+      
+      if ("leadingEdge" %in% colnames(gsea_df)) {
+        gsea_df$leadingEdge <- sapply(gsea_df$leadingEdge, function(x) {
+          paste(unlist(x), collapse = ";")
+        })
+      }
+      
+      list_cols <- sapply(gsea_df, is.list)
+      if (any(list_cols)) {
+        for (col in names(list_cols)[list_cols]) {
+          gsea_df[[col]] <- sapply(gsea_df[[col]], function(x) {
+            paste(unlist(x), collapse = ";")
+          })
+        }
+      }
+      
+      write.csv(gsea_df, file.path(tissue_dir, "GSEA", filename), row.names = FALSE)
+    }
+  }
+  
+  # Export CLR compositional analysis
+  if (!is.null(clr_results)) {
+    write.csv(clr_results$results,
+              file.path(tissue_dir, paste0(tissue_lower, "_compositional_CLR.csv")),
+              row.names = FALSE)
+  }
+  
+  # Export compositional
+  write.csv(comp_results$results, 
+            file.path(tissue_dir, paste0(tissue_lower, "_compositional_analysis.csv")),
+            row.names = FALSE)
+  
+  # Save Seurat object
+  saveRDS(seurat_obj, 
+          file.path(tissue_dir, paste0(tissue_lower, "_integrated_annotated.rds")))
+}
+
+
+# =============================================================================
+# MASTER WRAPPER FUNCTION - ANALYZES ONE TISSUE END-TO-END
+# =============================================================================
+
+analyze_tissue_complete <- function(
+    wt_seurat,
+    ko_seurat,
+    tissue_name,
+    output_dir = "results",
+    params = PARAMS,
+    s_genes = NULL,
+    g2m_genes = NULL,
+    verbose = TRUE
+) {
+  
+  if (verbose) {
+    cat("\n")
+    cat("=============================================================================\n")
+    cat(paste0("  ANALYZING: ", tissue_name, "\n"))
+    cat("=============================================================================\n\n")
+  }
+  
+  tissue_dir <- file.path(output_dir, tolower(gsub(" ", "", tissue_name)))
+  dir.create(tissue_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Step 1: Preprocessing
+  if (verbose) cat("STEP 1/9: Preprocessing...\n")
+  
+  wt_seurat$condition <- params$cacoa$ref_level
+  ko_seurat$condition <- params$cacoa$target_level
+  
+  combined <- merge(wt_seurat, ko_seurat,
+                    add.cell.ids = c("WT", "KO"),
+                    project = tissue_name)
+  
+  if (verbose) cat(paste0("  Merged: ", ncol(combined), " cells\n"))
+  
+  # Step 2: Normalization
+  if (verbose) cat("STEP 2/9: Normalization...\n")
+  
+  combined <- NormalizeData(combined,
+                            normalization.method = params$normalization$method,
+                            scale.factor = params$normalization$scale_factor)
+  combined <- FindVariableFeatures(combined, 
+                                   nfeatures = params$normalization$n_variable_features)
+  
+  # Step 3: Cell Cycle
+  if (verbose) cat("STEP 3/9: Cell cycle scoring...\n")
+  
+  if (!is.null(s_genes) && !is.null(g2m_genes)) {
+    combined <- CellCycleScoring(combined, 
+                                 s.features = s_genes,
+                                 g2m.features = g2m_genes)
+    
+    if (params$cell_cycle$regress) {
+      combined <- ScaleData(combined, 
+                            vars.to.regress = params$cell_cycle$vars_to_regress)
+    }
+  } else {
+    combined <- ScaleData(combined)
+  }
+  
+  # Step 4: Integration
+  if (verbose) cat("STEP 4/9: Integration...\n")
+  
+  sample_list <- SplitObject(combined, split.by = "condition")
+  anchors <- FindIntegrationAnchors(object.list = sample_list, 
+                                    dims = params$pca$dims_use)
+  integrated <- IntegrateData(anchorset = anchors, 
+                              dims = params$pca$dims_use)
+  
+  # Step 5: Dimensionality Reduction & Clustering
+  if (verbose) cat("STEP 5/9: PCA, UMAP, clustering...\n")
+  
+  integrated <- ScaleData(integrated)
+  integrated <- RunPCA(integrated, 
+                       npcs = params$pca$npcs,
+                       seed.use = params$random_seed)
+  integrated <- RunUMAP(integrated, 
+                        dims = params$umap$dims,
+                        seed.use = params$umap$seed)
+  integrated <- FindNeighbors(integrated, 
+                              dims = params$clustering$dims)
+  integrated <- FindClusters(integrated, 
+                             resolution = params$clustering$resolution,
+                             random.seed = params$clustering$seed)
+  
+  if (verbose) cat(paste0("  Found ", length(unique(integrated$seurat_clusters)), " clusters\n"))
+  
+  # Step 6: Annotation
+  if (verbose) cat("STEP 6/9: Cell type annotation...\n")
+  
+  integrated <- annotate_immune_cells(integrated)
+  
+  # Step 7: DEG, GO, GSEA
+  if (verbose) cat("STEP 7/9: DEG, GO, GSEA...\n")
+  
+  deg_results <- find_degs_per_celltype(integrated, 
+                                        min_cells = params$deg$min_cells_per_group,
+                                        params = params)
+  go_results <- run_go_enrichment(deg_results, params = params)
+  gsea_results <- run_gsea_per_celltype(deg_results, params = params)
+  gsea_plots <- plot_gsea_results(gsea_results, top_n = params$gsea$top_n_plot)
+  
+  # Step 8: Compositional
+  if (verbose) cat("STEP 8/9: Compositional analysis...\n")
+  
+  comp_results <- run_compositional_analysis(integrated, params = params)
+  comp_plots <- plot_compositional_results(comp_results, tissue_name)
+  
+  if (verbose) cat("STEP 8b/9: CLR compositional analysis...\n")
+  
+  clr_results <- compositional_analysis_proper(
+    integrated,
+    celltype_column = "SingleR_clean",
+    condition_column = "condition",
+    params = params
+  )
+  
+  clr_plots <- plot_clr_compositional(clr_results, tissue_name)
+  # Step 9: CACOA
+  if (verbose) cat("STEP 9/9: CACOA...\n")
+  
+  integrated$condition <- factor(integrated$condition, 
+                                 levels = c(params$cacoa$ref_level, params$cacoa$target_level))
+  
+  cao <- run_cacoa_analysis(integrated, params = params)
+  cacoa_plots <- plot_cacoa_results(cao, tissue_name)
+  cacoa_results_table <- extract_cacoa_results_table(cao)
+  
+  # Export
+  if (verbose) cat("\nExporting results...\n")
+  
+  export_tissue_results(integrated, deg_results, go_results, gsea_results,
+                        comp_results, clr_results,
+                        tissue_name, output_dir)
+  
+  stopifnot(
+    is.character(output_dir),
+    length(output_dir) == 1,
+    !is.na(output_dir),
+    nchar(output_dir) > 0)
+  
+  
+  export_cacoa_results(cao, cacoa_plots, cacoa_results_table,
+                       file.path(output_dir, "cacoa"),
+                       tolower(gsub(" ", "", tissue_name)))
+  
+  # Save compositional plots
+  pdf(file.path(tissue_dir, paste0(tolower(gsub(" ", "", tissue_name)), 
+                                   "_compositional_plots.pdf")), 
+      width = 12, height = 10)
+  print(comp_plots$volcano)
+  print(comp_plots$alluvial)
+  dev.off()
+  
+  # Save CLR plots
+  pdf(file.path(tissue_dir, paste0(tolower(gsub(" ", "", tissue_name)), 
+                                   "_compositional_CLR_plots.pdf")), 
+      width = 12, height = 10)
+  print(clr_plots$clr_barplot)
+  print(clr_plots$clr_scatter)
+  dev.off()
+  
+  # Save GSEA plots
+  pdf(file.path(tissue_dir, paste0(tolower(gsub(" ", "", tissue_name)), 
+                                   "_gsea_plots.pdf")), 
+      width = 12, height = 10)
+  for (ct in names(gsea_plots)) {
+    print(gsea_plots[[ct]])
+  }
+  dev.off()
+  
+  # Return everything
+  results <- list(
+    seurat = integrated,
+    deg = deg_results,
+    go = go_results,
+    gsea = gsea_results,
+    gsea_plots = gsea_plots,
+    compositional = comp_results,
+    compositional_plots = comp_plots,
+    clr_compositional = clr_results,
+    clr_plots = clr_plots,
+    cacoa = cao,
+    cacoa_plots = cacoa_plots,
+    cacoa_results = cacoa_results_table,
+    params = params,
+    tissue_name = tissue_name,
+    output_dir = tissue_dir
+  )
+  
+  saveRDS(results, file.path(tissue_dir, paste0(tolower(gsub(" ", "", tissue_name)), 
+                                                "_complete_results.rds")))
+  
+  if (verbose) {
+    cat("\n")
+    cat("=============================================================================\n")
+    cat(paste0("  ✓ ", tissue_name, " ANALYSIS COMPLETE\n"))
+    cat("=============================================================================\n\n")
+  }
+  
+  return(results)
+}
+
+cat("\n✓ All analysis functions loaded (including master wrapper)\n")
+
+# =============================================================================
+# 7. Cell Cycle Genes
+# =============================================================================
+
+cat("\n=== PREPARING CELL CYCLE GENES ===\n\n")
+
+# Get mouse cell cycle genes
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+# Convert to mouse format (Title case)
+s.genes <- str_to_title(tolower(s.genes))
+g2m.genes <- str_to_title(tolower(g2m.genes))
+
+# Filter for genes present in data
+s.genes <- intersect(s.genes, rownames(spl_WT_seurat))
+g2m.genes <- intersect(g2m.genes, rownames(spl_WT_seurat))
+
+cat(paste0("S phase genes: ", length(s.genes), "\n"))
+cat(paste0("G2M phase genes: ", length(g2m.genes), "\n\n"))
+
+# =============================================================================
+# 8. Spleen Analysis
+# =============================================================================
+
+cat("\n=== ANALYZING SPLEEN ===\n\n")
+
+# Run complete analysis with wrapper function
+results_spleen <- analyze_tissue_complete(
+  wt_seurat = spl_WT_seurat,
+  ko_seurat = spl_KO_seurat,
+  tissue_name = "Spleen",
+  output_dir = PARAMS$output$base_dir,
+  params = PARAMS,
+  s_genes = s.genes,
+  g2m_genes = g2m.genes,
+  verbose = TRUE
+)
+
+# Extract objects for downstream use
+spl_integrated <- results_spleen$seurat
+deg_results_spl <- results_spleen$deg
+go_results_spl <- results_spleen$go
+gsea_results_spl <- results_spleen$gsea
+gsea_plots_spl <- results_spleen$gsea_plots
+comp_results_spl <- results_spleen$compositional
+comp_plots_spl <- results_spleen$compositional_plots
+clr_results_spl <- results_spleen$clr_compositional
+clr_plots_spl <- results_spleen$clr_plots
+
+cat("\n✓ Spleen analysis complete\n")
+cat(paste0("  Cells: ", ncol(spl_integrated), "\n"))
+cat(paste0("  Cell types: ", length(unique(spl_integrated$SingleR_clean)), "\n"))
+cat(paste0("  DEG cell types: ", length(deg_results_spl), "\n"))
+cat(paste0("  Results: ", results_spleen$output_dir, "\n\n"))
+
+# Display key plots
+print(DimPlot(spl_integrated, group.by = "condition", 
+              cols = c("WT" = "#3498db", "KO" = "#e74c3c")) +
+        ggtitle("Spleen - WT vs KO"))
+
+print(DimPlot(spl_integrated, group.by = "SingleR_clean", label = FALSE) +
+        ggtitle("Spleen - Cell Type Annotation"))
+
+if (!is.null(comp_plots_spl$volcano)) {
+  print(comp_plots_spl$volcano)
+}
+
+if (!is.null(comp_plots_spl$alluvial)) {
+  print(comp_plots_spl$alluvial)
+}
+if (!is.null(clr_plots_spl$clr_barplot)) {
+  print(clr_plots_spl$clr_barplot)
+}
+
+if (!is.null(clr_plots_spl$clr_scatter)) {
+  print(clr_plots_spl$clr_scatter)
+}
+
+# =============================================================================
+# 9. Bone Marrow Analysis
+# =============================================================================
+
+cat("\n=== ANALYZING BONE MARROW ===\n\n")
+
+# Run complete analysis with wrapper function
+results_bonemarrow <- analyze_tissue_complete(
+  wt_seurat = bm_WT_seurat,
+  ko_seurat = bm_KO_seurat,
+  tissue_name = "BoneMarrow",
+  output_dir = PARAMS$output$base_dir,
+  params = PARAMS,
+  s_genes = s.genes,
+  g2m_genes = g2m.genes,
+  verbose = TRUE
+)
+
+# Extract objects for downstream use
+bm_integrated <- results_bonemarrow$seurat
+deg_results_bm <- results_bonemarrow$deg
+go_results_bm <- results_bonemarrow$go
+gsea_results_bm <- results_bonemarrow$gsea
+gsea_plots_bm <- results_bonemarrow$gsea_plots
+comp_results_bm <- results_bonemarrow$compositional
+comp_plots_bm <- results_bonemarrow$compositional_plots
+clr_results_bm <- results_bonemarrow$clr_compositional
+clr_plots_bm <- results_bonemarrow$clr_plots
+
+cat("\n✓ Bone Marrow analysis complete\n")
+cat(paste0("  Cells: ", ncol(bm_integrated), "\n"))
+cat(paste0("  Cell types: ", length(unique(bm_integrated$SingleR_clean)), "\n"))
+cat(paste0("  DEG cell types: ", length(deg_results_bm), "\n"))
+cat(paste0("  Results: ", results_bonemarrow$output_dir, "\n\n"))
+
+# Display key plots
+print(DimPlot(bm_integrated, group.by = "condition",
+              cols = c("WT" = "#3498db", "KO" = "#e74c3c")) +
+        ggtitle("Bone Marrow - WT vs KO"))
+
+print(DimPlot(bm_integrated, group.by = "SingleR_clean", label = FALSE) +
+        ggtitle("Bone Marrow - Cell Type Annotation"))
+
+if (!is.null(comp_plots_bm$volcano)) {
+  print(comp_plots_bm$volcano)
+}
+
+if (!is.null(comp_plots_bm$alluvial)) {
+  print(comp_plots_bm$alluvial)
+}
+
+if (!is.null(clr_plots_bm$clr_barplot)) {
+  print(clr_plots_bm$clr_barplot)
+}
+
+if (!is.null(clr_plots_bm$clr_scatter)) {
+  print(clr_plots_bm$clr_scatter)
+}
+
+
+cat("\n=== CREATING COMBINED ALLUVIAL PLOTS ===\n\n")
+
+# Check that both analyses exist
+if (!exists("comp_results_spl") || !exists("comp_results_bm")) {
+  stop("Error: Run compositional analysis for both tissues first")
+}
+
+# =============================================================================
+# CREATE GLOBAL COLOR PALETTE
+# =============================================================================
+
+cat("Creating global color palette...\n")
+
+# Get all unique cell types from both tissues
+spl_celltypes <- rownames(comp_results_spl$counts)
+bm_celltypes <- rownames(comp_results_bm$counts)
+
+all_celltypes <- unique(c(spl_celltypes, bm_celltypes))
+all_celltypes <- sort(all_celltypes)  # Alphabetical for consistency
+
+n_celltypes <- length(all_celltypes)
+
+cat(paste0("  Spleen cell types: ", length(spl_celltypes), "\n"))
+cat(paste0("  Bone Marrow cell types: ", length(bm_celltypes), "\n"))
+cat(paste0("  Total unique: ", n_celltypes, "\n\n"))
+
+# Create color palette
+if (n_celltypes <= 12) {
+  colors <- RColorBrewer::brewer.pal(max(n_celltypes, 3), "Set3")
+} else if (n_celltypes <= 20) {
+  colors <- c(
+    RColorBrewer::brewer.pal(12, "Set3"),
+    RColorBrewer::brewer.pal(8, "Set2")
+  )[1:n_celltypes]
+} else {
+  colors <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_celltypes)
+}
+
+names(colors) <- all_celltypes
+
+cat("Color assignments:\n")
+for (ct in all_celltypes) {
+  cat(paste0("  ", ct, ": ", colors[ct], "\n"))
+}
+cat("\n")
+
+# =============================================================================
+# CREATE ALLUVIAL PLOT FOR SPLEEN
+# =============================================================================
+
+cat("Creating Spleen alluvial plot...\n")
+
+# Prepare data
+props_spl <- prop.table(comp_results_spl$counts, margin = 2) * 100
+props_spl_df <- as.data.frame(props_spl)
+colnames(props_spl_df) <- c("CellType", "Condition", "Proportion")
+
+# Force order WT -> KO
+props_spl_df$Condition <- factor(props_spl_df$Condition, levels = c("WT", "KO"))
+
+# Force cell type order (matching global palette)
+props_spl_df$CellType <- factor(props_spl_df$CellType, levels = all_celltypes)
+
+# Get colors for spleen cell types
+colors_spl <- colors[spl_celltypes]
+
+# Create alluvial plot
+p_alluvial_spl <- ggplot(props_spl_df,
+                         aes(x = Condition,
+                             stratum = CellType,
+                             alluvium = CellType,
+                             y = Proportion,
+                             fill = CellType)) +
+  geom_alluvium(alpha = 0.6, knot.pos = 0.4) +
+  geom_stratum(alpha = 0.9, color = "grey70", width = 0.3) +
+  scale_fill_manual(values = colors_spl, name = "Cell Type", drop = FALSE) +
+  scale_x_discrete(limits = c("WT", "KO")) +
+  labs(
+    x = "",
+    y = "Cell Proportion (%)",
+    title = "Spleen - Cell Type Composition Flow",
+    subtitle = "WT → KO"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+
+# =============================================================================
+# CREATE ALLUVIAL PLOT FOR BONE MARROW
+# =============================================================================
+
+cat("Creating Bone Marrow alluvial plot...\n")
+
+# Prepare data
+props_bm <- prop.table(comp_results_bm$counts, margin = 2) * 100
+props_bm_df <- as.data.frame(props_bm)
+colnames(props_bm_df) <- c("CellType", "Condition", "Proportion")
+
+# Force order WT -> KO
+props_bm_df$Condition <- factor(props_bm_df$Condition, levels = c("WT", "KO"))
+
+# Force cell type order (matching global palette)
+props_bm_df$CellType <- factor(props_bm_df$CellType, levels = all_celltypes)
+
+# Get colors for bone marrow cell types
+colors_bm <- colors[bm_celltypes]
+
+# Create alluvial plot
+p_alluvial_bm <- ggplot(props_bm_df,
+                        aes(x = Condition,
+                            stratum = CellType,
+                            alluvium = CellType,
+                            y = Proportion,
+                            fill = CellType)) +
+  geom_alluvium(alpha = 0.6, knot.pos = 0.4) +
+  geom_stratum(alpha = 0.9, color = "grey70", width = 0.3) +
+  scale_fill_manual(values = colors_bm, name = "Cell Type", drop = FALSE) +
+  scale_x_discrete(limits = c("WT", "KO")) +
+  labs(
+    x = "",
+    y = "Cell Proportion (%)",
+    title = "Bone Marrow - Cell Type Composition Flow",
+    subtitle = "WT → KO"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+
+# =============================================================================
+# DISPLAY PLOTS SIDE BY SIDE
+# =============================================================================
+
+cat("Creating combined view...\n")
+
+# Display individual plots
+print(p_alluvial_spl)
+print(p_alluvial_bm)
+
+# Create side-by-side comparison using patchwork
+p_combined <- p_alluvial_spl + p_alluvial_bm +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Cell Type Composition Comparison: Spleen vs Bone Marrow",
+    subtitle = "Consistent colors across tissues show cell type identity",
+    theme = theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey40")
+    )
+  )
+
+print(p_combined)
+
+# =============================================================================
+# SAVE PLOTS
+# =============================================================================
+
+cat("Saving alluvial plots...\n")
+
+# Save individual plots
+ggsave("results/spleen/spleen_alluvial_plot.png", 
+       plot = p_alluvial_spl, 
+       width = 10, height = 8, dpi = 300)
+
+ggsave("results/bonemarrow/bonemarrow_alluvial_plot.png", 
+       plot = p_alluvial_bm, 
+       width = 10, height = 8, dpi = 300)
+
+# Save combined plot
+ggsave("results/combined_alluvial_comparison.png",
+       plot = p_combined,
+       width = 18, height = 8, dpi = 300)
+
+ggsave("results/combined_alluvial_comparison.pdf",
+       plot = p_combined,
+       width = 18, height = 8)
+
+# Save color mapping for reference
+color_mapping <- data.frame(
+  CellType = names(colors),
+  Color = colors,
+  In_Spleen = names(colors) %in% spl_celltypes,
+  In_BoneMarrow = names(colors) %in% bm_celltypes,
+  stringsAsFactors = FALSE
+)
+
+write.csv(color_mapping, "results/celltype_color_mapping.csv", row.names = FALSE)
+
+cat("\n✓ Alluvial plots created with consistent colors\n")
+cat("✓ Plots saved:\n")
+cat("  - results/spleen/spleen_alluvial_plot.png\n")
+cat("  - results/bonemarrow/bonemarrow_alluvial_plot.png\n")
+cat("  - results/combined_alluvial_comparison.png\n")
+cat("  - results/combined_alluvial_comparison.pdf\n")
+cat("  - results/celltype_color_mapping.csv\n\n")
+
+cat("\n=== COMBINED ALLUVIAL ANALYSIS COMPLETE ===\n\n")
+
+# =============================================================================
+# 10. Cross-Tissue Comparison
+# =============================================================================
+
+convert_deg_list_to_df <- function(deg_list, tissue_name = "tissue") {
+  
+  if (!is.list(deg_list)) {
+    stop(paste0(tissue_name, " DEG results is not a list"))
+  }
+  
+  deg_df <- data.frame()
+  
+  for (ct in names(deg_list)) {
+    ct_results <- deg_list[[ct]]
+    if (nrow(ct_results) == 0) next
+    
+    ct_results$cluster <- ct
+    
+    if (!"gene" %in% colnames(ct_results)) {
+      ct_results$gene <- rownames(ct_results)
+    }
+    
+    deg_df <- rbind(deg_df, ct_results)
+  }
+  
+  return(deg_df)
+}
+
+# -----------------------------------------------------------------------------
+# DEG CORRELATION ANALYSIS
+# -----------------------------------------------------------------------------
+
+plot_tissue_comparison_improved <- function(deg_tissue1, deg_tissue2, 
+                                            tissue1_name = "Tissue1",
+                                            tissue2_name = "Tissue2",
+                                            celltype_column = "cluster",
+                                            min_genes = 10) {
+  
+  cat(paste0("\n=== COMPARING ", tissue1_name, " vs ", tissue2_name, " ===\n\n"))
+  
+  celltypes_tissue1 <- unique(deg_tissue1[[celltype_column]])
+  celltypes_tissue2 <- unique(deg_tissue2[[celltype_column]])
+  common_celltypes <- intersect(celltypes_tissue1, celltypes_tissue2)
+  
+  cat(paste0("Common cell types: ", length(common_celltypes), "\n\n"))
+  
+  if (length(common_celltypes) == 0) {
+    cat("No common cell types found!\n")
+    return(NULL)
+  }
+  
+  comparison_results <- list()
+  plot_list <- list()
+  stats_summary <- data.frame()
+  
+  for (ct in common_celltypes) {
+    
+    deg1 <- deg_tissue1[deg_tissue1[[celltype_column]] == ct, ]
+    deg2 <- deg_tissue2[deg_tissue2[[celltype_column]] == ct, ]
+    common_genes <- intersect(deg1$gene, deg2$gene)
+    
+    if (length(common_genes) < min_genes) next
+    
+    merged <- merge(deg1[, c("gene", "avg_log2FC", "p_val_adj")],
+                    deg2[, c("gene", "avg_log2FC", "p_val_adj")],
+                    by = "gene",
+                    suffixes = c(paste0("_", tissue1_name), paste0("_", tissue2_name)))
+    
+    colnames(merged) <- c("gene", 
+                          paste0("log2FC_", tissue1_name),
+                          paste0("padj_", tissue1_name),
+                          paste0("log2FC_", tissue2_name),
+                          paste0("padj_", tissue2_name))
+    
+    # Statistics
+    cor_test <- cor.test(merged[[paste0("log2FC_", tissue1_name)]],
+                         merged[[paste0("log2FC_", tissue2_name)]],
+                         method = "pearson")
+    
+    pearson_r <- cor_test$estimate
+    pearson_p <- cor_test$p.value
+    r_squared <- pearson_r^2
+    
+    lm_fit <- lm(merged[[paste0("log2FC_", tissue2_name)]] ~ 
+                   merged[[paste0("log2FC_", tissue1_name)]])
+    slope <- coef(lm_fit)[2]
+    intercept <- coef(lm_fit)[1]
+    
+    stats_summary <- rbind(stats_summary, data.frame(
+      CellType = ct,
+      N_genes = nrow(merged),
+      Pearson_r = pearson_r,
+      Pearson_p = pearson_p,
+      R_squared = r_squared,
+      Slope = slope,
+      Intercept = intercept,
+      Interpretation = ifelse(pearson_p < 0.001, "***",
+                              ifelse(pearson_p < 0.01, "**",
+                                     ifelse(pearson_p < 0.05, "*", "ns")))
+    ))
+    
+    # Plot
+    max_log2fc <- max(abs(c(merged[[paste0("log2FC_", tissue1_name)]],
+                            merged[[paste0("log2FC_", tissue2_name)]])))
+    axis_limits <- c(-ceiling(max_log2fc), ceiling(max_log2fc))
+    
+    p_label <- ifelse(pearson_p < 0.001, "p < 0.001",
+                      sprintf("p = %.3f", pearson_p))
+    
+    p <- ggplot(merged, aes(x = .data[[paste0("log2FC_", tissue1_name)]],
+                            y = .data[[paste0("log2FC_", tissue2_name)]])) +
+      geom_point(alpha = 0.4, size = 1.2, color = "steelblue") +
+      geom_density_2d(color = "gray30", alpha = 0.3, linewidth = 0.3) +
+      geom_abline(intercept = 0, slope = 1, 
+                  color = "red", linetype = "dashed", linewidth = 1.2, alpha = 0.8) +
+      geom_smooth(method = "lm", color = "#3498db", se = TRUE,
+                  fill = "#3498db", alpha = 0.2, linewidth = 1.2) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+      coord_fixed(ratio = 1, xlim = axis_limits, ylim = axis_limits) +
+      annotate("text", 
+               x = axis_limits[1] + 0.1 * diff(axis_limits),
+               y = axis_limits[2] - 0.1 * diff(axis_limits),
+               label = sprintf("r = %.3f | R² = %.3f\n%s | n = %d",
+                               pearson_r, r_squared, p_label, nrow(merged)),
+               hjust = 0, vjust = 1, size = 3.5, fontface = "bold") +
+      theme_classic(base_size = 12) +
+      labs(
+        title = ct,
+        subtitle = sprintf("Pearson r = %.3f, R² = %.3f", pearson_r, r_squared),
+        x = paste0("log₂ FC (", tissue1_name, ")"),
+        y = paste0("log₂ FC (", tissue2_name, ")"),
+        caption = "Red dashed: perfect correlation (x=y) | Blue: regression"
+      ) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray30"),
+        plot.caption = element_text(hjust = 0.5, size = 8, color = "grey50"),
+        panel.grid.major = element_line(color = "gray95", linewidth = 0.3)
+      )
+    
+    plot_list[[ct]] <- p
+    comparison_results[[ct]] <- merged
+  }
+  
+  # Summary plot
+  if (nrow(stats_summary) > 0) {
+    stats_summary <- stats_summary[order(-stats_summary$R_squared), ]
+    stats_summary$CellType <- factor(stats_summary$CellType, levels = stats_summary$CellType)
+    
+    p_summary <- ggplot(stats_summary, aes(x = CellType, y = R_squared, fill = R_squared)) +
+      geom_bar(stat = "identity") +
+      geom_text(aes(label = sprintf("%.2f%s", R_squared, Interpretation)),
+                hjust = -0.1, size = 3) +
+      scale_fill_gradient2(low = "#3498db", mid = "#f39c12", high = "#e74c3c",
+                           midpoint = 0.5, limits = c(0, 1), name = "R²") +
+      coord_flip() +
+      ylim(0, 1.15) +
+      theme_classic(base_size = 12) +
+      labs(title = "Cross-Tissue DEG Correlation Summary",
+           subtitle = paste0(tissue1_name, " vs ", tissue2_name),
+           x = "", y = "R²") +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+    
+    plot_list[["summary"]] <- p_summary
+  }
+  
+  # Combined scatter plot
+  scatter_plot_names <- setdiff(names(plot_list), "summary")
+  
+  if (length(scatter_plot_names) > 0) {
+    n_plots <- length(scatter_plot_names)
+    n_cols <- ceiling(sqrt(n_plots))
+    
+    combined_plot <- wrap_plots(plot_list[scatter_plot_names], ncol = n_cols) +
+      plot_annotation(
+        title = paste0("Cross-Tissue DEG Comparison: ", tissue1_name, " vs ", tissue2_name),
+        theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+      )
+    
+    plot_list[["combined_scatter"]] <- combined_plot
+  }
+  
+  return(list(plots = plot_list, data = comparison_results, statistics = stats_summary))
+}
+
+# -----------------------------------------------------------------------------
+# CLR COMPOSITIONAL COMPARISON
+# -----------------------------------------------------------------------------
+
+compare_clr_across_tissues <- function(clr_spl, clr_bm) {
+  
+  cat("\n=== CROSS-TISSUE CLR COMPARISON ===\n\n")
+  
+  merged <- merge(
+    clr_spl$results[, c("CellType", "CLR_difference")],
+    clr_bm$results[, c("CellType", "CLR_difference")],
+    by = "CellType",
+    suffixes = c("_Spleen", "_BoneMarrow")
+  )
+  
+  cor_test <- cor.test(merged$CLR_difference_Spleen, 
+                       merged$CLR_difference_BoneMarrow,
+                       method = "pearson")
+  
+  cat(paste0("Cell types: ", nrow(merged), "\n"))
+  cat(paste0("Correlation: r = ", round(cor_test$estimate, 3), 
+             ", p = ", format.pval(cor_test$p.value, digits = 3), "\n\n"))
+  
+  merged$Consistent <- sign(merged$CLR_difference_Spleen) == 
+    sign(merged$CLR_difference_BoneMarrow) &
+    abs(merged$CLR_difference_Spleen) > 0.5 &
+    abs(merged$CLR_difference_BoneMarrow) > 0.5
+  
+  cat("Consistent changes:\n")
+  consistent <- merged[merged$Consistent, ]
+  if (nrow(consistent) > 0) print(consistent) else cat("  None\n")
+  
+  max_clr <- max(abs(c(merged$CLR_difference_Spleen, 
+                       merged$CLR_difference_BoneMarrow)))
+  axis_limits <- c(-ceiling(max_clr), ceiling(max_clr))
+  
+  p <- ggplot(merged, aes(x = CLR_difference_Spleen, 
+                          y = CLR_difference_BoneMarrow,
+                          label = CellType,
+                          color = Consistent)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", 
+                color = "red", linewidth = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_text_repel(size = 3, max.overlaps = 20) +
+    scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "#e74c3c"),
+                       name = "Consistent") +
+    coord_fixed(ratio = 1, xlim = axis_limits, ylim = axis_limits) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = "Cross-Tissue CLR Comparison",
+      subtitle = sprintf("r = %.3f (p = %s) | %d cell types",
+                         cor_test$estimate, 
+                         format.pval(cor_test$p.value, digits = 2),
+                         nrow(merged)),
+      x = "CLR Difference (Spleen)",
+      y = "CLR Difference (Bone Marrow)",
+      caption = "Red diagonal: perfect agreement | Consistent = same direction & |CLR| > 0.5"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5))
+  
+  print(p)
+  
+  return(list(merged = merged, plot = p, correlation = cor_test))
+}
+
+# -----------------------------------------------------------------------------
+# SHARED/UNIQUE DEGs ANALYSIS
+# -----------------------------------------------------------------------------
+
+analyze_shared_degs <- function(deg_list_tissue1, deg_list_tissue2,
+                                tissue1_name = "Tissue1",
+                                tissue2_name = "Tissue2",
+                                padj_cutoff = 0.05,
+                                logfc_cutoff = 0) {
+  
+  celltypes_t1 <- names(deg_list_tissue1)
+  celltypes_t2 <- names(deg_list_tissue2)
+  common_celltypes <- intersect(celltypes_t1, celltypes_t2)
+  
+  cat(paste0("\n=== SHARED/UNIQUE DEGs: ", length(common_celltypes), " cell types ===\n\n"))
+  
+  results_list <- list()
+  summary_df <- data.frame()
+  
+  for (ct in common_celltypes) {
+    
+    cat(paste0(ct, ": "))
+    
+    deg1 <- deg_list_tissue1[[ct]]
+    deg2 <- deg_list_tissue2[[ct]]
+    
+    # Significant DEGs
+    sig1_up <- deg1$gene[deg1$avg_log2FC > logfc_cutoff & deg1$p_val_adj < padj_cutoff]
+    sig1_down <- deg1$gene[deg1$avg_log2FC < -logfc_cutoff & deg1$p_val_adj < padj_cutoff]
+    sig2_up <- deg2$gene[deg2$avg_log2FC > logfc_cutoff & deg2$p_val_adj < padj_cutoff]
+    sig2_down <- deg2$gene[deg2$avg_log2FC < -logfc_cutoff & deg2$p_val_adj < padj_cutoff]
+    
+    # Shared and unique
+    shared_up <- intersect(sig1_up, sig2_up)
+    shared_down <- intersect(sig1_down, sig2_down)
+    unique_t1_up <- setdiff(sig1_up, sig2_up)
+    unique_t1_down <- setdiff(sig1_down, sig2_down)
+    unique_t2_up <- setdiff(sig2_up, sig1_up)
+    unique_t2_down <- setdiff(sig2_down, sig1_down)
+    discordant_t1up_t2down <- intersect(sig1_up, sig2_down)
+    discordant_t1down_t2up <- intersect(sig1_down, sig2_up)
+    
+    cat(sprintf("Shared ↑%d ↓%d | Unique %s ↑%d ↓%d | Unique %s ↑%d ↓%d\n",
+                length(shared_up), length(shared_down),
+                tissue1_name, length(unique_t1_up), length(unique_t1_down),
+                tissue2_name, length(unique_t2_up), length(unique_t2_down)))
+    
+    # Add to summary
+    summary_df <- rbind(summary_df, data.frame(
+      CellType = ct,
+      Shared_UP = length(shared_up),
+      Shared_DOWN = length(shared_down),
+      Total_Shared = length(shared_up) + length(shared_down),
+      Unique_T1_UP = length(unique_t1_up),
+      Unique_T1_DOWN = length(unique_t1_down),
+      Unique_T2_UP = length(unique_t2_up),
+      Unique_T2_DOWN = length(unique_t2_down),
+      Discordant = length(discordant_t1up_t2down) + length(discordant_t1down_t2up),
+      stringsAsFactors = FALSE
+    ))
+    
+    # Store gene lists
+    results_list[[ct]] <- list(
+      shared_up = shared_up, 
+      shared_down = shared_down,
+      unique_t1_up = unique_t1_up, 
+      unique_t1_down = unique_t1_down,
+      unique_t2_up = unique_t2_up, 
+      unique_t2_down = unique_t2_down,
+      discordant_t1up_t2down = discordant_t1up_t2down,
+      discordant_t1down_t2up = discordant_t1down_t2up,
+      deg1 = deg1, 
+      deg2 = deg2
+    )
+  }
+  
+  # Sort summary
+  summary_df <- summary_df[order(-summary_df$Total_Shared), ]
+  
+  return(list(results = results_list, summary = summary_df))
+}
+
+# -----------------------------------------------------------------------------
+# BASELINE EXPRESSION COMPARISON (CON SCATTER Y MA PLOTS)
+# -----------------------------------------------------------------------------
+
+compare_baseline_expression_pseudobulk <- function(
+    seurat_spl, seurat_bm,
+    celltype_column = "SingleR_clean",
+    condition_column = "condition",
+    min_cells_per_type = 30,
+    min_genes = 500,
+    use_pseudobulk = TRUE) {
+  
+  cat("\n=== BASELINE EXPRESSION COMPARISON ===\n")
+  cat(sprintf("Method: %s | Min cells: %d | Min genes: %d\n\n",
+              ifelse(use_pseudobulk, "Pseudo-bulk", "Simple average"),
+              min_cells_per_type, min_genes))
+  
+  celltypes_spl <- unique(seurat_spl@meta.data[[celltype_column]])
+  celltypes_bm <- unique(seurat_bm@meta.data[[celltype_column]])
+  common_celltypes <- intersect(celltypes_spl, celltypes_bm)
+  
+  cat(paste0("Common cell types: ", length(common_celltypes), "\n\n"))
+  
+  results_list <- list()
+  
+  for (ct in common_celltypes) {
+    
+    cat(paste0(ct, ": "))
+    
+    cells_spl <- colnames(seurat_spl)[seurat_spl@meta.data[[celltype_column]] == ct]
+    cells_bm <- colnames(seurat_bm)[seurat_bm@meta.data[[celltype_column]] == ct]
+    
+    cat(sprintf("Spl %d cells, BM %d cells", length(cells_spl), length(cells_bm)))
+    
+    if (length(cells_spl) < min_cells_per_type | length(cells_bm) < min_cells_per_type) {
+      cat(" → SKIPPED (insufficient)\n")
+      next
+    }
+    
+    DefaultAssay(seurat_spl) <- "RNA"
+    DefaultAssay(seurat_bm) <- "RNA"
+    
+    expr_spl <- GetAssayData(seurat_spl, slot = "data")[, cells_spl]
+    expr_bm <- GetAssayData(seurat_bm, slot = "data")[, cells_bm]
+    
+    if (use_pseudobulk) {
+      conditions_spl <- seurat_spl@meta.data[cells_spl, condition_column]
+      conditions_bm <- seurat_bm@meta.data[cells_bm, condition_column]
+      
+      wt_cells_spl <- cells_spl[conditions_spl == "WT"]
+      ko_cells_spl <- cells_spl[conditions_spl == "KO"]
+      wt_cells_bm <- cells_bm[conditions_bm == "WT"]
+      ko_cells_bm <- cells_bm[conditions_bm == "KO"]
+      
+      avg_expr_spl <- rowMeans(cbind(
+        rowMeans(expr_spl[, wt_cells_spl, drop = FALSE]),
+        rowMeans(expr_spl[, ko_cells_spl, drop = FALSE])
+      ))
+      
+      avg_expr_bm <- rowMeans(cbind(
+        rowMeans(expr_bm[, wt_cells_bm, drop = FALSE]),
+        rowMeans(expr_bm[, ko_cells_bm, drop = FALSE])
+      ))
+    } else {
+      avg_expr_spl <- rowMeans(expr_spl)
+      avg_expr_bm <- rowMeans(expr_bm)
+    }
+    
+    common_genes <- intersect(names(avg_expr_spl), names(avg_expr_bm))
+    expressed_genes <- common_genes[(avg_expr_spl[common_genes] > 0.1) | 
+                                      (avg_expr_bm[common_genes] > 0.1)]
+    
+    if (length(expressed_genes) < min_genes) {
+      cat(" → SKIPPED (too few genes)\n")
+      next
+    }
+    
+    expr_df <- data.frame(
+      gene = expressed_genes,
+      spleen_log2 = log2(avg_expr_spl[expressed_genes] + 1),
+      bonemarrow_log2 = log2(avg_expr_bm[expressed_genes] + 1),
+      stringsAsFactors = FALSE
+    )
+    
+    expr_df$M <- expr_df$spleen_log2 - expr_df$bonemarrow_log2
+    expr_df$A <- (expr_df$spleen_log2 + expr_df$bonemarrow_log2) / 2
+    
+    cor_pearson <- cor.test(expr_df$spleen_log2, expr_df$bonemarrow_log2, method = "pearson")
+    cor_spearman <- cor.test(expr_df$spleen_log2, expr_df$bonemarrow_log2, method = "spearman")
+    
+    mean_M <- mean(expr_df$M)
+    sd_M <- sd(expr_df$M)
+    
+    cat(sprintf(" → r=%.3f, M=%.3f\n", cor_pearson$estimate, mean_M))
+    
+    results_list[[ct]] <- list(
+      data = expr_df,
+      pearson_r = cor_pearson$estimate, pearson_p = cor_pearson$p.value,
+      spearman_rho = cor_spearman$estimate, spearman_p = cor_spearman$p.value,
+      mean_M = mean_M, sd_M = sd_M,
+      n_genes = nrow(expr_df),
+      n_cells_spl = length(cells_spl), n_cells_bm = length(cells_bm)
+    )
+  }
+  
+  cat("\n✓ Complete\n\n")
+  return(results_list)
+}
+
+# Crear SCATTER PLOTS para baseline
+plot_baseline_scatter <- function(baseline_results, celltype) {
+  
+  result <- baseline_results[[celltype]]
+  expr_df <- result$data
+  
+  max_val <- max(c(expr_df$spleen_log2, expr_df$bonemarrow_log2))
+  axis_limits <- c(0, ceiling(max_val))
+  
+  p <- ggplot(expr_df, aes(x = spleen_log2, y = bonemarrow_log2)) +
+    geom_hex(bins = 50, aes(fill = after_stat(count))) +
+    scale_fill_viridis_c(name = "Gene\nDensity", trans = "log10", option = "plasma") +
+    geom_abline(intercept = 0, slope = 1, 
+                color = "red", linetype = "dashed", linewidth = 1.2, alpha = 0.8) +
+    geom_smooth(method = "lm", color = "blue", se = TRUE, 
+                fill = "lightblue", alpha = 0.2, linewidth = 1) +
+    coord_fixed(ratio = 1, xlim = axis_limits, ylim = axis_limits) +
+    annotate("text", 
+             x = axis_limits[1] + 0.5, 
+             y = axis_limits[2] - 1,
+             label = sprintf(
+               "Pearson r = %.3f (p = %.2e)\nSpearman ρ = %.3f\n%d genes | %d Spl, %d BM cells",
+               result$pearson_r, result$pearson_p, result$spearman_rho, 
+               result$n_genes, result$n_cells_spl, result$n_cells_bm
+             ),
+             hjust = 0, vjust = 1, size = 3.5, fontface = "bold") +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("Baseline Expression - ", celltype),
+      subtitle = "Do genes have similar expression in both tissues?",
+      x = "log₂(mean expression + 1) - Spleen",
+      y = "log₂(mean expression + 1) - Bone Marrow",
+      caption = "Red: perfect correlation (x=y) | Blue: regression | r > 0.8 = comparable"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30"),
+      plot.caption = element_text(hjust = 0.5, size = 8, color = "grey50", lineheight = 1.2),
+      aspect.ratio = 1
+    )
+  
+  return(p)
+}
+
+# Crear MA PLOTS para baseline
+plot_baseline_ma <- function(baseline_results, celltype) {
+  
+  result <- baseline_results[[celltype]]
+  expr_df <- result$data
+  mean_M <- result$mean_M
+  sd_M <- result$sd_M
+  
+  expr_df$Outlier <- abs(expr_df$M - mean_M) > 2 * sd_M
+  
+  p <- ggplot(expr_df, aes(x = A, y = M)) +
+    geom_hex(bins = 50, aes(fill = after_stat(count))) +
+    scale_fill_viridis_c(name = "Gene\nDensity", trans = "log10", option = "plasma") +
+    geom_point(data = subset(expr_df, Outlier), 
+               color = "red", size = 1, alpha = 0.5) +
+    geom_hline(yintercept = 0, color = "darkgreen", 
+               linetype = "solid", linewidth = 1.2, alpha = 0.7) +
+    geom_hline(yintercept = mean_M, color = "red", linewidth = 1, alpha = 0.8) +
+    geom_hline(yintercept = mean_M + 2*sd_M, 
+               color = "red", linetype = "dashed", linewidth = 0.8) +
+    geom_hline(yintercept = mean_M - 2*sd_M, 
+               color = "red", linetype = "dashed", linewidth = 0.8) +
+    geom_smooth(method = "loess", color = "blue", se = TRUE,
+                fill = "lightblue", alpha = 0.2, linewidth = 1) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0("MA Plot - ", celltype),
+      subtitle = "Systematic bias detection",
+      x = "A = Average log₂ Expression [(Spleen + BM) / 2]",
+      y = "M = log₂ Ratio [Spleen / BM]",
+      caption = sprintf(
+        "Green (M=0): no bias | Red (M=%.2f): mean bias | Dashed: ±2SD [%.2f, %.2f]\nM≈0 = no bias | M>0 = Spleen higher | M<0 = BM higher",
+        mean_M, mean_M - 2*sd_M, mean_M + 2*sd_M
+      )
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey30"),
+      plot.caption = element_text(hjust = 0.5, size = 8, color = "grey50", lineheight = 1.2)
+    )
+  
+  return(p)
+}
+
+# Summary plot
+plot_baseline_summary <- function(baseline_results) {
+  
+  summary_df <- do.call(rbind, lapply(names(baseline_results), function(ct) {
+    r <- baseline_results[[ct]]
+    data.frame(
+      CellType = ct,
+      Pearson_r = r$pearson_r,
+      Mean_M = r$mean_M,
+      N_genes = r$n_genes,
+      N_cells_spleen = r$n_cells_spl,
+      N_cells_bonemarrow = r$n_cells_bm,
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  summary_df <- summary_df[order(-summary_df$Pearson_r), ]
+  summary_df$CellType <- factor(summary_df$CellType, levels = summary_df$CellType)
+  
+  summary_df$Quality <- case_when(
+    summary_df$Pearson_r > 0.9 ~ "Excellent (r > 0.9)",
+    summary_df$Pearson_r > 0.8 ~ "Good (r > 0.8)",
+    summary_df$Pearson_r > 0.7 ~ "Moderate (r > 0.7)",
+    summary_df$Pearson_r > 0.5 ~ "Fair (r > 0.5)",
+    TRUE ~ "Poor (r < 0.5)"
+  )
+  
+  summary_df$Quality <- factor(summary_df$Quality, 
+                               levels = c("Excellent (r > 0.9)", "Good (r > 0.8)", 
+                                          "Moderate (r > 0.7)", "Fair (r > 0.5)", 
+                                          "Poor (r < 0.5)"))
+  
+  p <- ggplot(summary_df, aes(x = CellType, y = Pearson_r, fill = Quality)) +
+    geom_bar(stat = "identity") +
+    geom_hline(yintercept = c(0.5, 0.7, 0.8, 0.9), 
+               linetype = "dashed", color = "grey50", alpha = 0.7) +
+    geom_text(aes(label = sprintf("r=%.2f\nn=%d", Pearson_r, N_genes)),
+              vjust = -0.3, size = 2.8, fontface = "bold") +
+    scale_fill_manual(
+      values = c("Excellent (r > 0.9)" = "#27ae60", "Good (r > 0.8)" = "#f39c12",
+                 "Moderate (r > 0.7)" = "#e67e22", "Fair (r > 0.5)" = "#e74c3c",
+                 "Poor (r < 0.5)" = "#c0392b"),
+      name = "Correlation"
+    ) +
+    coord_flip() +
+    ylim(0, 1.15) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = "Baseline Expression Correlation Summary",
+      subtitle = "Spleen vs Bone Marrow - Are cell types comparable?",
+      x = "Cell Type", y = "Pearson Correlation (r)",
+      caption = "r > 0.8: comparable | r < 0.7: tissue-specific programs"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      plot.caption = element_text(hjust = 0.5, size = 9, color = "grey50")
+    )
+  
+  return(list(plot = p, table = summary_df))
+}
+
+# -----------------------------------------------------------------------------
+# MASTER EXPORT FUNCTION (OPTIMIZED)
+# -----------------------------------------------------------------------------
+
+export_cross_tissue_results <- function(
+    deg_comparison = NULL,
+    clr_comparison = NULL,
+    baseline_results = NULL,
+    baseline_summary = NULL,
+    shared_degs = NULL,
+    output_dir = "results") {
+  
+  comp_dir <- file.path(output_dir, "tissue_comparison")
+  dir.create(comp_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cat("\n=== EXPORTING CROSS-TISSUE RESULTS ===\n\n")
+  
+  # 1. DEG Correlation
+  if (!is.null(deg_comparison)) {
+    cat("1. DEG correlation...\n")
+    
+    write.csv(deg_comparison$statistics,
+              file.path(comp_dir, "deg_correlation_statistics.csv"),
+              row.names = FALSE)
+    
+    if ("combined_scatter" %in% names(deg_comparison$plots)) {
+      ggsave(file.path(comp_dir, "deg_correlation_combined.png"),
+             plot = deg_comparison$plots$combined_scatter,
+             width = 16, height = 12, dpi = 300)
+    }
+    
+    cat("   ✓ Saved\n")
+  }
+  
+  # 2. CLR Comparison
+  if (!is.null(clr_comparison)) {
+    cat("2. CLR comparison...\n")
+    
+    write.csv(clr_comparison$merged,
+              file.path(comp_dir, "clr_comparison_table.csv"),
+              row.names = FALSE)
+    
+    ggsave(file.path(comp_dir, "clr_comparison.png"),
+           plot = clr_comparison$plot, width = 10, height = 8, dpi = 300)
+    
+    cat("   ✓ Saved\n")
+  }
+  
+  # 3. Baseline Expression
+  if (!is.null(baseline_summary)) {
+    cat("3. Baseline expression...\n")
+    
+    write.csv(baseline_summary$table,
+              file.path(comp_dir, "baseline_correlation_summary.csv"),
+              row.names = FALSE)
+    
+    ggsave(file.path(comp_dir, "baseline_correlation_summary.png"),
+           plot = baseline_summary$plot, width = 12, height = 10, dpi = 300)
+    
+    # Scatter and MA plots for each cell type
+    if (!is.null(baseline_results)) {
+      for (ct in names(baseline_results)) {
+        ct_clean <- gsub("[/ ]", "_", ct)
+        
+        p_scatter <- plot_baseline_scatter(baseline_results, ct)
+        ggsave(file.path(comp_dir, paste0("baseline_scatter_", ct_clean, ".png")),
+               plot = p_scatter, width = 10, height = 10, dpi = 300)
+        
+        p_ma <- plot_baseline_ma(baseline_results, ct)
+        ggsave(file.path(comp_dir, paste0("baseline_MA_", ct_clean, ".png")),
+               plot = p_ma, width = 10, height = 8, dpi = 300)
+      }
+    }
+    
+    cat("   ✓ Saved\n")
+  }
+  
+  # 4. Shared DEGs
+  if (!is.null(shared_degs)) {
+    cat("4. Shared/Unique DEGs...\n")
+    
+    write.csv(shared_degs$summary,
+              file.path(comp_dir, "shared_unique_degs_summary.csv"),
+              row.names = FALSE)
+    
+    # Individual gene lists
+    for (ct in names(shared_degs$results)) {
+      r <- shared_degs$results[[ct]]
+      ct_clean <- gsub("[/ ]", "_", ct)
+      
+      if (length(r$shared_up) > 0) {
+        shared_up_df <- data.frame(
+          gene = r$shared_up,
+          log2FC_T1 = r$deg1[r$deg1$gene %in% r$shared_up, "avg_log2FC"],
+          padj_T1 = r$deg1[r$deg1$gene %in% r$shared_up, "p_val_adj"],
+          log2FC_T2 = r$deg2[r$deg2$gene %in% r$shared_up, "avg_log2FC"],
+          padj_T2 = r$deg2[r$deg2$gene %in% r$shared_up, "p_val_adj"]
+        )
+        write.csv(shared_up_df,
+                  file.path(comp_dir, paste0("shared_UP_", ct_clean, ".csv")),
+                  row.names = FALSE)
+      }
+      
+      if (length(r$shared_down) > 0) {
+        shared_down_df <- data.frame(
+          gene = r$shared_down,
+          log2FC_T1 = r$deg1[r$deg1$gene %in% r$shared_down, "avg_log2FC"],
+          padj_T1 = r$deg1[r$deg1$gene %in% r$shared_down, "p_val_adj"],
+          log2FC_T2 = r$deg2[r$deg2$gene %in% r$shared_down, "avg_log2FC"],
+          padj_T2 = r$deg2[r$deg2$gene %in% r$shared_down, "p_val_adj"]
+        )
+        write.csv(shared_down_df,
+                  file.path(comp_dir, paste0("shared_DOWN_", ct_clean, ".csv")),
+                  row.names = FALSE)
+      }
+    }
+    
+    cat("   ✓ Saved\n")
+  }
+  
+  # 5. Master PDF
+  cat("5. Creating master PDF...\n")
+  
+  pdf(file.path(comp_dir, "CROSS_TISSUE_COMPLETE_REPORT.pdf"),
+      width = 16, height = 12)
+  
+  if (!is.null(baseline_summary)) print(baseline_summary$plot)
+  if (!is.null(clr_comparison)) print(clr_comparison$plot)
+  if (!is.null(deg_comparison) && "summary" %in% names(deg_comparison$plots)) {
+    print(deg_comparison$plots$summary)
+  }
+  if (!is.null(deg_comparison) && "combined_scatter" %in% names(deg_comparison$plots)) {
+    print(deg_comparison$plots$combined_scatter)
+  }
+  
+  # Add scatter and MA plots for baseline
+  if (!is.null(baseline_results)) {
+    for (ct in names(baseline_results)) {
+      print(plot_baseline_scatter(baseline_results, ct))
+      print(plot_baseline_ma(baseline_results, ct))
+    }
+  }
+  
+  dev.off()
+  
+  cat("   ✓ PDF created\n\n")
+  cat(sprintf("All results saved to: %s\n", comp_dir))
+}
+
+cat("✓ Cross-tissue comparison functions loaded\n")
+
+
+cat("\n=== PREPARING DEGs ===\n\n")
+
+deg_results_spl_df <- convert_deg_list_to_df(deg_results_spl, "Spleen")
+deg_results_bm_df <- convert_deg_list_to_df(deg_results_bm, "Bone Marrow")
+
+cat(sprintf("Spleen: %d DEGs across %d cell types\n",
+            nrow(deg_results_spl_df), length(unique(deg_results_spl_df$cluster))))
+cat(sprintf("Bone Marrow: %d DEGs across %d cell types\n\n",
+            nrow(deg_results_bm_df), length(unique(deg_results_bm_df$cluster))))
+
+
+cat("\n")
+cat("================================================================================\n")
+cat("  CROSS-TISSUE COMPARISON - COMPLETE ANALYSIS\n")
+cat("================================================================================\n\n")
+
+# 1. DEG Correlation
+deg_comp <- plot_tissue_comparison_improved(
+  deg_tissue1 = deg_results_spl_df,
+  deg_tissue2 = deg_results_bm_df,
+  tissue1_name = "Spleen",
+  tissue2_name = "BoneMarrow",
+  celltype_column = "cluster",
+  min_genes = PARAMS$comparison$min_common_genes
+)
+
+if (!is.null(deg_comp)) {
+  print(deg_comp$plots$summary)
+  print(deg_comp$plots$combined_scatter)
+  print(knitr::kable(deg_comp$statistics[, c("CellType", "N_genes", "Pearson_r", 
+                                             "R_squared", "Interpretation")],
+                     digits = 3, caption = "DEG Correlation Statistics"))
+}
+
+# 2. CLR Compositional
+clr_comp <- compare_clr_across_tissues(
+  results_spleen$clr_compositional,
+  results_bonemarrow$clr_compositional
+)
+
+# 3. Shared/Unique DEGs (SIN VENN DIAGRAMS)
+shared_degs <- analyze_shared_degs(
+  deg_list_tissue1 = deg_results_spl,
+  deg_list_tissue2 = deg_results_bm,
+  tissue1_name = "Spleen",
+  tissue2_name = "BoneMarrow",
+  padj_cutoff = PARAMS$deg$padj_cutoff,
+  logfc_cutoff = 0
+)
+
+print(knitr::kable(shared_degs$summary, 
+                   caption = "Shared and Unique DEGs Summary"))
+
+# 4. Baseline Expression (CON SCATTER Y MA PLOTS)
+baseline_results <- compare_baseline_expression_pseudobulk(
+  seurat_spl = spl_integrated,
+  seurat_bm = bm_integrated,
+  celltype_column = "SingleR_clean",
+  condition_column = "condition",
+  min_cells_per_type = 30,
+  min_genes = 500,
+  use_pseudobulk = TRUE
+)
+
+baseline_summary <- plot_baseline_summary(baseline_results)
+print(baseline_summary$plot)
+print(knitr::kable(baseline_summary$table, digits = 3,
+                   caption = "Baseline Expression Correlation"))
+
+# Display scatter and MA plots for top 3 cell types (by correlation)
+top_celltypes <- baseline_summary$table$CellType[1:min(3, nrow(baseline_summary$table))]
+
+for (ct in top_celltypes) {
+  cat(paste0("\n=== ", ct, " ===\n"))
+  print(plot_baseline_scatter(baseline_results, ct))
+  print(plot_baseline_ma(baseline_results, ct))
+}
+
+# 5. EXPORT ALL (UNA SOLA LLAMADA)
+export_cross_tissue_results(
+  deg_comparison = deg_comp,
+  clr_comparison = clr_comp,
+  baseline_results = baseline_results,
+  baseline_summary = baseline_summary,
+  shared_degs = shared_degs,
+  output_dir = PARAMS$output$base_dir
+)
+
+cat("\n✓ Cross-tissue analysis complete\n\n")
