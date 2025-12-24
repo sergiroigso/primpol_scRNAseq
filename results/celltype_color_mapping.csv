@@ -1,0 +1,18 @@
+"CellType","Color","In_Spleen","In_BoneMarrow"
+"B cells","#8DD3C7",TRUE,TRUE
+"B cells, pro","#FFFFB3",TRUE,TRUE
+"Basophils","#BEBADA",TRUE,TRUE
+"DC","#FB8072",TRUE,TRUE
+"Endothelial cells","#80B1D3",FALSE,TRUE
+"Eosinophils","#FDB462",TRUE,TRUE
+"Fibroblasts","#B3DE69",FALSE,TRUE
+"ILC","#FCCDE5",TRUE,TRUE
+"Macrophages","#D9D9D9",TRUE,TRUE
+"Monocytes","#BC80BD",TRUE,TRUE
+"Neutrophils","#CCEBC5",TRUE,TRUE
+"NK cells","#FFED6F",TRUE,TRUE
+"NKT","#66C2A5",TRUE,TRUE
+"Stem cells","#FC8D62",TRUE,TRUE
+"Stromal cells","#8DA0CB",FALSE,TRUE
+"T cells","#E78AC3",TRUE,TRUE
+"Tgd","#A6D854",TRUE,TRUE

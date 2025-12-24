@@ -1,0 +1,12 @@
+"CellType","Shared_UP","Shared_DOWN","Total_Shared","Unique_T1_UP","Unique_T1_DOWN","Unique_T2_UP","Unique_T2_DOWN","Discordant"
+"B cells",169,17,186,567,84,707,132,21
+"T cells",43,24,67,774,99,30,40,3
+"Monocytes",5,4,9,3,6,86,64,2
+"Neutrophils",1,3,4,7,10,257,77,2
+"NKT",0,0,0,1,0,0,5,0
+"Stem cells",0,0,0,1,0,359,57,0
+"DC",0,0,0,0,0,3,13,0
+"NK cells",0,0,0,4,0,1,8,0
+"Macrophages",0,0,0,3,0,13,18,0
+"Basophils",0,0,0,0,0,0,2,0
+"ILC",0,0,0,0,0,0,0,0

@@ -1,5 +1,5 @@
-"Sample","Total_cells","Singlets","Doublets","Doublet_rate_pct","Mean_doublet_score","Median_UMI","Median_genes","Median_MT","Median_Ribo"
-"Spleen WT",4055,3758,297,7.32,0.095,3647,1716,2.58,14.07
-"Spleen KO",3418,3184,234,6.85,0.097,4412.5,2035.5,2.54,15.99
-"Bone Marrow WT",4162,3836,326,7.83,0.108,4606.5,1749.5,1.32,3.44
-"Bone Marrow KO",5575,5014,561,10.06,0.133,5921,2118,1.52,4.76
+"Sample","Total_cells","Singlets","Doublets","Median_UMI","Median_genes","Median_MT"
+"Spleen WT",4055,3750,305,3647,1716,2.58
+"Spleen KO",3418,3184,234,4412.5,2035.5,2.54
+"Bone Marrow WT",4162,3842,320,4606.5,1749.5,1.32
+"Bone Marrow KO",5575,5011,564,5921,2118,1.52

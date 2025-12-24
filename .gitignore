@@ -8,25 +8,12 @@
 *.Rproj
 
 # ===================================
-# LARGE DATA FILES (DON'T UPLOAD!)
+# LARGE DATA FILES
 # ===================================
-*.h5
 *.rds
 *.RDS
 *.rda
 *.RData
-
-# ===================================
-# RESULT FILES
-# ===================================
-results/**/*.rds
-results/**/*.pdf
-results/**/*.html
-*.pdf
-*.html
-
-# Keep CSV and plots
-!results/**/*.csv
 
 # ===================================
 # SYSTEM FILES
