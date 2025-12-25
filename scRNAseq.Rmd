@@ -1506,6 +1506,8 @@ cat(paste0("  DEG cell types: ", length(deg_results_spl), "\n"))
 cat(paste0("  Results: ", results_spleen$output_dir, "\n\n"))
 
 # Display key plots
+print(ElbowPlot(spl_integrated, ndims = 50))
+
 print(DimPlot(spl_integrated, group.by = "condition", 
               cols = c("WT" = "#3498db", "KO" = "#e74c3c")) +
   ggtitle("Spleen - WT vs KO"))
@@ -1564,6 +1566,7 @@ cat(paste0("  DEG cell types: ", length(deg_results_bm), "\n"))
 cat(paste0("  Results: ", results_bonemarrow$output_dir, "\n\n"))
 
 # Display key plots
+print(ElbowPlot(bm_integrated, ndims = 50))
 print(DimPlot(bm_integrated, group.by = "condition",
               cols = c("WT" = "#3498db", "KO" = "#e74c3c")) +
   ggtitle("Bone Marrow - WT vs KO"))
